@@ -3,52 +3,31 @@ import itertools
 import json
 import math
 import random
-import sys
 import time
 from collections import defaultdict, deque
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 from loguru import logger
 from playwright.async_api import async_playwright, BrowserContext, Page
 
-import dom_utils
-from llm import LLM, LocalLLM, estimate_image_tokens
-import re
+from agent.config import Config
+import agent.dom_utils as dom_utils
+import agent.pruning as pruning
+from agent.llm import PrimaryLLM, estimate_image_tokens
+from agent.pruning import Pruning
 
 
-def init():
-    logger.remove()
-    logger.add(
-        sys.stdout,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
-    )
-
-    env = json.loads(Path("env.json").read_text())
-    llm_service = env["llm_service"]
-    local_llm_service = env["local_llm_service"]
-    llm_config = env[llm_service]
-    local_llm_config = env[local_llm_service]
-
-    LLM.init(
-        api_key=llm_config["api_key"],
-        base_url=llm_config["base_url"],
-        temperature=0.0,
-        text_model=llm_config["text_model"],
-        image_model=llm_config["image_model"],
-    )
-    LocalLLM.init(
-        api_key=local_llm_config["api_key"],
-        base_url=local_llm_config["base_url"],
-        temperature=0.0,
-        text_model=local_llm_config["text_model"],
-        image_model=local_llm_config["image_model"],
-    )
-
-
-async def apply_task_action_env(context: BrowserContext, annotation_id: str, action_uid: str, bounds: dict,
-                                last_action_pos: tuple[float, float] | None, data_dir: Path):
+async def apply_task_action_env(
+    context: BrowserContext,
+    annotation_id: str,
+    action_uid: str,
+    bounds: dict,
+    last_action_pos: tuple[float, float] | None,
+    data_dir: Path,
+):
     mhtml_path = data_dir / annotation_id / f"{action_uid}_before.mhtml"
     page = await context.new_page()
     await page.goto(str(mhtml_path))
@@ -57,9 +36,9 @@ async def apply_task_action_env(context: BrowserContext, annotation_id: str, act
         await page.mouse.move(*last_action_pos)
         await asyncio.sleep(0.5)
 
-    elem_top = bounds['y']
-    elem_bottom = bounds['y'] + bounds['height']
-    xy = (bounds['x'], elem_top, bounds['x'] + bounds['width'], elem_bottom)
+    elem_top = bounds["y"]
+    elem_bottom = bounds["y"] + bounds["height"]
+    xy = (bounds["x"], elem_top, bounds["x"] + bounds["width"], elem_bottom)
     return page, xy
 
 
@@ -67,47 +46,18 @@ def time_stamp():
     return time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
 
-async def determine_action_by_llm(task_description: str, dom_text: str, screenshot_image: Image.Image):
-    prompt = f"""
-You are a web automation agent. Your goal is to decide the single most appropriate next interaction element based on the current page state.
-
-[Task Objective]
-{task_description}
-
-[Interactive Elements on the Page]
-Below is a list of all interactive elements currently available on the page.  
-Each element is prefixed with a unique [backend_node_id]:
-{dom_text}
-
-[Your Task]
-- Determine which one interactive element should be used next to achieve the task objective.
-- Do not plan multiple steps or explain your reasoning.
-
-[Output Format (strict, no extra text)]
-backend_node_id=<id>
-""".strip()
-
-    detail = await LLM.chat_with_image_detail(prompt, screenshot_image)
-    res = detail["content"]
-
-    pattern = re.compile(r"backend_node_id=<?(?P<id>\d+)>?")
-
-    match = pattern.search(res)
-    assert match is not None
-    backend_node_id = int(match.group("id").strip())
-    return backend_node_id, detail
-
-
 async def main():
-    data_path = Path("D:/globus/mind2web")
-    init()
+    data_path = Path("local/mind2web")
+    Config.init("env.json")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            executable_path="C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-            headless=True,
-            # headless=False,
+            executable_path=Config.browser_executable_path,
+            headless=Config.browser_headless,
         )
-        context = await browser.new_context(viewport={"width": 1280, "height": 720})
+        context = await browser.new_context(
+            viewport={"width": Config.browser_viewport_w, "height": Config.browser_viewport_h}
+        )
 
         all_data_names = ["test_domain", "test_task", "test_website"]
         for data_name in all_data_names:
@@ -134,13 +84,15 @@ async def main():
                         continue
                     bounding_box = action["action"]["bounding_box"]
 
-                    page, target_bounds = await apply_task_action_env(context, annotation_id, action_uid, bounding_box,
-                                                                      last_action_pos, data_path)
+                    page, target_bounds = await apply_task_action_env(
+                        context, annotation_id, action_uid, bounding_box, last_action_pos, data_path
+                    )
 
                     out_dir_path = Path(f"out/{annotation_id}/{time_stamp()}_{a_index + 1:02}_{action_uid}")
                     out_dir_path.mkdir(parents=True, exist_ok=True)
-                    last_action_pos = await evaluate(page, annotation_id, confirmed_task, action_uid, target_bounds,
-                                                     out_dir_path)
+                    last_action_pos = await evaluate(
+                        page, annotation_id, confirmed_task, action_uid, target_bounds, out_dir_path
+                    )
                     await page.close()
                     await asyncio.sleep(3)
 
@@ -175,17 +127,26 @@ def find_most_match_node(tree: dom_utils.DomNode, action_target_bounds: tuple[fl
     return min_dist_node
 
 
-async def evaluate(page: Page, annotation_id: str, task_description: str, action_uid: str,
-                   action_target_bounds: tuple[float, float, float, float], out_dir: Path):
+async def evaluate(
+    page: Page,
+    annotation_id: str,
+    task_description: str,
+    action_uid: str,
+    action_target_bounds: tuple[float, float, float, float],
+    out_dir: Path,
+):
     stage_time = [("start", time.time())]
 
     # 获取 DOM 等数据
     cdp_session = await page.context.new_cdp_session(page)
     dom = await cdp_session.send("DOM.getDocument", {"depth": -1})
-    snapshot = await cdp_session.send("DOMSnapshot.captureSnapshot", {
-        "computedStyles": ["display", "visibility", "opacity"],
-        "includeDOMRects": True,
-    })
+    snapshot = await cdp_session.send(
+        "DOMSnapshot.captureSnapshot",
+        {
+            "computedStyles": ["display", "visibility", "opacity"],
+            "includeDOMRects": True,
+        },
+    )
     viewport = dom_utils.Viewport(await cdp_session.send("Page.getLayoutMetrics"))
     font_18 = ImageFont.load_default(size=18)
     tree = dom_utils.parse_dom(dom, snapshot)
@@ -195,7 +156,7 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
     center_x = (target_node.bounds[0] + target_node.bounds[2]) / 2
     center_y = (target_node.bounds[1] + target_node.bounds[3]) / 2
 
-    result = {
+    result: dict[str, Any] = {
         "task": {
             "annotation_id": annotation_id,
             "description": task_description,
@@ -238,27 +199,28 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
     target_op_screenshot = screenshot.copy()
     target_op_screenshot_draw = ImageDraw.Draw(target_op_screenshot)
     target_op_screenshot_draw.rectangle(action_target_bounds, outline="red", width=3)
-    target_node.draw_bounds(target_op_screenshot_draw, viewport, outline="green", width=3, draw_id=True,
-                            recursive=False)
+    target_node.draw_bounds(
+        target_op_screenshot_draw, viewport, outline="green", width=3, draw_id=True, recursive=False
+    )
     target_op_screenshot.save(out_dir / "0_target_op.jpg")
 
     stage_time.append(("fetch", time.time()))
     stage_tree_repr = [("raw", tree.get_human_tree_repr())]
 
-    dom_utils.trim_dom_tree_by_visibility(tree, viewport)
+    Pruning.trim_dom_tree_by_visibility(tree, viewport)
     stage_tree_repr.append(("visibility", tree.get_human_tree_repr()))
 
-    dom_utils.filter_dom_tree_by_node(tree)
+    Pruning.filter_dom_tree_by_node(tree)
     stage_tree_repr.append(("filter", tree.get_human_tree_repr()))
 
-    dom_utils.promote_dom_tree_children(tree)
-    stage_tree_repr.append(["promote", tree.get_human_tree_repr()])
+    Pruning.promote_dom_tree_children(tree)
+    stage_tree_repr.append(("promote", tree.get_human_tree_repr()))
 
-    dom_utils.merge_dom_tree_children(tree)
-    stage_tree_repr.append(["merge", tree.get_human_tree_repr()])
+    Pruning.merge_dom_tree_children(tree)
+    stage_tree_repr.append(("merge", tree.get_human_tree_repr()))
 
-    dom_utils.clean_dom_tree_attrs(tree)
-    stage_tree_repr.append(["clean", tree.get_human_tree_repr()])
+    Pruning.clean_dom_tree_attrs(tree)
+    stage_tree_repr.append(("clean", tree.get_human_tree_repr()))
     stage_time.append(("refine", time.time()))
 
     # 最细粒度元素可视化
@@ -272,16 +234,26 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
     interactive_screenshot = screenshot.copy()
     interactive_screenshot_draw = ImageDraw.Draw(interactive_screenshot)
     for node in interactive_nodes:
-        node.draw_bounds(interactive_screenshot_draw, viewport, outline="blue", width=2, draw_id=True,
-                         recursive=False, max_bounds=True)
+        node.draw_bounds(
+            interactive_screenshot_draw,
+            viewport,
+            outline="blue",
+            width=2,
+            draw_id=True,
+            recursive=False,
+            max_bounds=True,
+        )
     interactive_screenshot.save(out_dir / "2_interactive.jpg")
     stage_time.append(("_debug", time.time()))
 
     # alpha 高时以空间距离为主，方便裁剪
     # alpha 低时以DOM结构为主，更符合分类
     clusters = dom_utils.cluster_dom_rects(interactive_nodes, alpha=0.45, distance_threshold=0.45)
-    clusters = [c for c in clusters if
-                dom_utils.map_bounds_to_viewport(dom_utils.get_covered_bounds(c), viewport) is not None]
+    clusters = [
+        c
+        for c in clusters
+        if dom_utils.map_bounds_to_viewport(dom_utils.get_cluster_covered_bounds(c), viewport) is not None
+    ]
     assert len(clusters) >= 1
     if len(clusters) == 1:
         logger.warning("[Cluster] Cluster label count too small: {}", len(clusters))
@@ -297,16 +269,23 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
         color = colors[index % len(colors)]
         width = 2
         for node in cluster:
-            node.draw_bounds(cluster_screenshot_draw, viewport, outline=color, width=width, draw_id=True,
-                             recursive=False,
-                             max_bounds=True)
+            node.draw_bounds(
+                cluster_screenshot_draw,
+                viewport,
+                outline=color,
+                width=width,
+                draw_id=True,
+                recursive=False,
+                max_bounds=True,
+            )
 
-        bounds = dom_utils.get_covered_bounds(cluster)
+        bounds = dom_utils.get_cluster_covered_bounds(cluster)
         rect = dom_utils.map_bounds_to_viewport(bounds, viewport)
         assert rect is not None
         cluster_screenshot_draw.rectangle(rect, outline=color, width=width + 3)
-        cluster_screenshot_draw.text((rect[0] + width + 3, rect[1] + width + 3), f"{index + 1}", fill=color,
-                                     font=font_18)
+        cluster_screenshot_draw.text(
+            (rect[0] + width + 3, rect[1] + width + 3), f"{index + 1}", fill=color, font=font_18
+        )
     cluster_screenshot.save(out_dir / "3_cluster_all.jpg")
     stage_time.append(("_debug", time.time()))
 
@@ -314,7 +293,7 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
     related_tasks = []
     related_rects = []
     for index, cluster in enumerate(clusters):
-        bounds = dom_utils.get_covered_bounds(cluster)
+        bounds = dom_utils.get_cluster_covered_bounds(cluster)
         rect = dom_utils.map_bounds_to_viewport(bounds, viewport)
         assert rect is not None
         related_rects.append(rect)
@@ -322,6 +301,8 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
         cluster_region_draw = ImageDraw.Draw(cluster_region)
         for node in cluster:
             node_bounds = node.max_bounds()
+            if node_bounds is None:
+                continue
             node_bounds = dom_utils.map_bounds_to_viewport(node_bounds, viewport)
             if node_bounds is None:
                 continue
@@ -333,18 +314,20 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
             )
             cluster_region_draw.rectangle(node_bounds, outline="red", width=2)
         cluster_region.save(out_dir / f"4_cluster_{index + 1}.jpg")
-        related_tasks.append(determine_cluster_task_related(cluster, cluster_region, task=task_description))
+        related_tasks.append(pruning._determine_cluster_related(cluster, cluster_region, task=task_description))
     # if len(clusters) > 1:
     related_tasks_res = await asyncio.gather(*related_tasks)
     related_cluster = [
-        (cluster, rect) for (flag, _), cluster, rect in
-        zip(related_tasks_res, clusters, related_rects)
-        if flag
+        (cluster, rect) for (flag, _), cluster, rect in zip(related_tasks_res, clusters, related_rects) if flag
     ]
     flags = [flag for flag, _ in related_tasks_res]
     if related_cluster:
-        logger.debug("[Pruning] {} related, {} unrelated: {}", len(related_cluster),
-                     len(flags) - len(related_cluster), str(flags))
+        logger.debug(
+            "[Pruning] {} related, {} unrelated: {}",
+            len(related_cluster),
+            len(flags) - len(related_cluster),
+            str(flags),
+        )
         # else:
         #     logger.warning("[Pruning] All unrelated, fallback to all, {}", str(flags))
         #     related_cluster = list(zip(clusters, related_rects))
@@ -353,11 +336,7 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
     #     logger.warning("[Pruning] Only one cluster, skip pruning")
     #     related_cluster = [(clusters[0], related_rects[0])]
 
-    result["clusters"] = {
-        "all_count": len(clusters),
-        "related_count": len(related_cluster),
-        "result": flags
-    }
+    result["clusters"] = {"all_count": len(clusters), "related_count": len(related_cluster), "result": flags}
 
     stage_time.append(("pruning", time.time()))
 
@@ -370,16 +349,14 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
         compacted_screenshot.save(out_dir / "5_compacted.jpg")
         stage_time.append(("compact", time.time()))
 
-        final_nodes: list[dom_utils.DomNode] = list(itertools.chain.from_iterable(
-            cluster for cluster, _rect in related_cluster
-        ))
-        stage_tree_repr.append(
-            ["pruning", "\n\n".join([node.get_human_tree_repr() for node in final_nodes])]
+        final_nodes: list[dom_utils.DomNode] = list(
+            itertools.chain.from_iterable(cluster for cluster, _rect in related_cluster)
         )
+        stage_tree_repr.append(("pruning", "\n\n".join([node.get_human_tree_repr() for node in final_nodes])))
 
         # 输出 token, time 对比信息
         result["text_tokens"] = pretty_print_tokens(stage_tree_repr)
-        result["image_tokens"] = pretty_print_image_token(screenshot, compacted_screenshot, LLM.image_model)
+        result["image_tokens"] = pretty_print_image_token(screenshot, compacted_screenshot, PrimaryLLM.image_model)
         result["time"] = pretty_print_time(stage_time)
 
         # 判断操作目标元素是否被过滤
@@ -397,19 +374,23 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
         else:
             logger.success("[Result] Action target node available")
 
-            agent_determined_id, details = await determine_action_by_llm(task_description, stage_tree_repr[-1][1],
-                                                                         compacted_screenshot)
+            agent_determined_id, details = await determine_action_by_llm(
+                task_description, stage_tree_repr[-1][1], compacted_screenshot
+            )
             determined_node = tree.find_nodes_by_backend_node_ids([agent_determined_id])[0]
             if determined_node is not None:
                 agent_determined_image = screenshot.copy()
                 agent_determined_image_draw = ImageDraw.Draw(agent_determined_image)
-                determined_node.draw_bounds(agent_determined_image_draw, viewport, outline="red", width=2,
-                                            draw_id=True, recursive=False)
+                determined_node.draw_bounds(
+                    agent_determined_image_draw, viewport, outline="red", width=2, draw_id=True, recursive=False
+                )
                 agent_determined_image.save(out_dir / "6_agent_determined.jpg")
             result["agent"] = details
 
-            if target_node.find_ancestor_by_backend_node_id(agent_determined_id) is not None or \
-                    target_node.find_nodes_by_backend_node_ids([agent_determined_id])[0] is not None:
+            if (
+                target_node.find_ancestor_by_backend_node_id(agent_determined_id) is not None
+                or target_node.find_nodes_by_backend_node_ids([agent_determined_id])[0] is not None
+            ):
                 success = True
                 logger.success("[Result] Agent determined node is correct")
             else:
@@ -433,31 +414,9 @@ async def evaluate(page: Page, annotation_id: str, task_description: str, action
     return center_x, center_y
 
 
-async def determine_cluster_task_related(nodes: list[dom_utils.DomNode], image: Image.Image, task: str):
-    prompt = f"""
-You are an experienced UI automation testing developer.
-You need to determine whether the UI elements in the current region screenshot could be related to "{task}".
-You should make this judgment based on the DOM elements list provided below and the corresponding UI screenshot (the relevant elements are highlighted with red boxes).
-If there is any potential relationship, output Yes; if they are completely unrelated, output No. Do not output any other text.
-
-DOM elements:
-{'\n\n'.join([node.get_human_tree_repr(no_end=True, no_id=True) for node in nodes])}
-""".strip()
-
-    # resized_image = dom_image.copy().resize((round(dom_image.size[0] * 0.75), round(dom_image.size[1] * 0.75)))
-    res = await LocalLLM.chat_with_image_detail(
-        prompt=prompt,
-        image=image,
-    )
-
-    content: str = res["content"].strip()
-    assert content.lower() in {"yes", "no"}
-    flag = content.lower() == "yes"
-    return flag, res
-
-
-def merge_overlapped_rects(related_cluster: list[tuple[list[dom_utils.DomNode], tuple[int, int, int, int]]]
-                           ) -> list[tuple[list[dom_utils.DomNode], tuple[int, int, int, int]]]:
+def merge_overlapped_rects(
+    related_cluster: list[tuple[list[dom_utils.DomNode], tuple[int, int, int, int]]],
+) -> list[tuple[list[dom_utils.DomNode], tuple[int, int, int, int]]]:
     merged = []
 
     def overlaps(r1, r2):
@@ -484,36 +443,36 @@ def merge_overlapped_rects(related_cluster: list[tuple[list[dom_utils.DomNode], 
     return merged
 
 
-def build_constraints(rects: list[dict], axis='x'):
+def build_constraints(rects: list[dict], axis="x"):
     # axis: 'x' 或 'y'
     constraints = []  # list of (before_id, after_id)
     # 两两排列构建顺序规则
     for a, b in itertools.combinations(rects, 2):
-        if axis == 'x':
-            a1, a2 = a['orig'][0], a['orig'][2]  # x1, x2
-            b1, b2 = b['orig'][0], b['orig'][2]
+        if axis == "x":
+            a1, a2 = a["orig"][0], a["orig"][2]  # x1, x2
+            b1, b2 = b["orig"][0], b["orig"][2]
         else:
-            a1, a2 = a['orig'][1], a['orig'][3]  # y1, y2
-            b1, b2 = b['orig'][1], b['orig'][3]
+            a1, a2 = a["orig"][1], a["orig"][3]  # y1, y2
+            b1, b2 = b["orig"][1], b["orig"][3]
 
         # 判断是否在该轴上分离（无重叠）
         if a2 <= b1:
-            constraints.append((a['id'], b['id']))  # a 在 b 之前
+            constraints.append((a["id"], b["id"]))  # a 在 b 之前
         elif b2 <= a1:
-            constraints.append((b['id'], a['id']))  # b 在 a 之前
+            constraints.append((b["id"], a["id"]))  # b 在 a 之前
     return constraints
 
 
-def layout_1d(rects: list[dict], constraints: list[tuple[int, int]], axis='x', default_gap=5) -> dict[int, int]:
+def layout_1d(rects: list[dict], constraints: list[tuple[int, int]], axis="x", default_gap=5) -> dict[int, int]:
     # rects: list of rect with 'id', 'size'
     # constraints: list of (before, after)
     # return: start_pos in dict with 'id' as key
 
-    size_key = 0 if axis == 'x' else 1  # width or height
+    size_key = 0 if axis == "x" else 1  # width or height
 
     # 构建图和入度
     graph = defaultdict(list)
-    in_degree = {r['id']: 0 for r in rects}
+    in_degree = {r["id"]: 0 for r in rects}
     for u, v in constraints:
         graph[u].append(v)
         in_degree[v] += 1
@@ -537,8 +496,8 @@ def layout_1d(rects: list[dict], constraints: list[tuple[int, int]], axis='x', d
     end_pos = {}  # 记录每个节点的结束位置（用于后续约束）
 
     for r in rects:
-        pos[r['id']] = 0
-        end_pos[r['id']] = 0
+        pos[r["id"]] = 0
+        end_pos[r["id"]] = 0
 
     # 按拓扑序放置，并加上默认间距
     for node_id in order:
@@ -550,22 +509,26 @@ def layout_1d(rects: list[dict], constraints: list[tuple[int, int]], axis='x', d
 
         # 放置当前节点
         pos[node_id] = min_start
-        w_or_h = round(next(r['size'][size_key] for r in rects if r['id'] == node_id))
+        w_or_h = round(next(r["size"][size_key] for r in rects if r["id"] == node_id))
         end_pos[node_id] = min_start + w_or_h
 
     return pos
 
 
-def image_layout_compaction(screenshot: Image.Image,
-                            merged_rects: list[tuple[list[dom_utils.DomNode], tuple[int, int, int, int]]],
-                            viewport: dom_utils.Viewport,
-                            default_gap=5):
+def image_layout_compaction(
+    screenshot: Image.Image,
+    merged_rects: list[tuple[list[dom_utils.DomNode], tuple[int, int, int, int]]],
+    viewport: dom_utils.Viewport,
+    default_gap=5,
+):
     crops = []
     for cluster, rect in merged_rects:
         crop = screenshot.crop(rect)
         draw = ImageDraw.Draw(crop)
         for node in cluster:
             node_bounds = node.max_bounds()
+            if node_bounds is None:
+                continue
             node_bounds = dom_utils.map_bounds_to_viewport(node_bounds, viewport)
             if node_bounds is None:
                 continue
@@ -582,28 +545,24 @@ def image_layout_compaction(screenshot: Image.Image,
     # 构建 rects 结构
     rect_data = []
     for i, (_, (x1, y1, x2, y2)) in enumerate(merged_rects):
-        rect_data.append({
-            'id': i,
-            'orig': (x1, y1, x2, y2),
-            'size': (x2 - x1, y2 - y1)
-        })
+        rect_data.append({"id": i, "orig": (x1, y1, x2, y2), "size": (x2 - x1, y2 - y1)})
 
     # 构建约束
-    x_constraints = build_constraints(rect_data, 'x')
-    y_constraints = build_constraints(rect_data, 'y')
+    x_constraints = build_constraints(rect_data, "x")
+    y_constraints = build_constraints(rect_data, "y")
 
     # 布局
-    x_pos = layout_1d(rect_data, x_constraints, 'x', default_gap)
-    y_pos = layout_1d(rect_data, y_constraints, 'y', default_gap)
+    x_pos = layout_1d(rect_data, x_constraints, "x", default_gap)
+    y_pos = layout_1d(rect_data, y_constraints, "y", default_gap)
 
     # 计算画布大小
-    max_w = math.ceil(max(x_pos[r['id']] + r['size'][0] for r in rect_data))
-    max_h = math.ceil(max(y_pos[r['id']] + r['size'][1] for r in rect_data))
+    max_w = math.ceil(max(x_pos[r["id"]] + r["size"][0] for r in rect_data))
+    max_h = math.ceil(max(y_pos[r["id"]] + r["size"][1] for r in rect_data))
 
     # 创建新图像
-    output_img = Image.new('RGB', (max_w, max_h), (0, 0, 0, 0))
+    output_img = Image.new("RGB", (max_w, max_h), (0, 0, 0, 0))
     for r in rect_data:
-        idx = r['id']
+        idx = r["id"]
         output_img.paste(crops[idx], (x_pos[idx], y_pos[idx]))
 
     return output_img
@@ -613,10 +572,7 @@ def pretty_print_tokens(stage_reprs: list[tuple[str, str]]):
     if not stage_reprs:
         return
 
-    stage_tokens = [
-        (name, len(dom_utils.tiktoken_enc.encode(text)))
-        for name, text in stage_reprs
-    ]
+    stage_tokens = [(name, len(dom_utils.tiktoken_enc.encode(text))) for name, text in stage_reprs]
 
     raw_cnt = stage_tokens[0][1]
     if PRINT_FLAG:
@@ -634,21 +590,11 @@ def pretty_print_tokens(stage_reprs: list[tuple[str, str]]):
             compression = 1.0
         else:
             delta = prev - cnt  # 只表示减少量
-            compression = raw_cnt / cnt if cnt > 0 else float('inf')
-        out.append({
-            "name": name,
-            "tokens": cnt,
-            "delta": delta,
-            "compression": round(compression, 2)
-        })
+            compression = raw_cnt / cnt if cnt > 0 else float("inf")
+        out.append({"name": name, "tokens": cnt, "delta": delta, "compression": round(compression, 2)})
 
         if PRINT_FLAG:
-            print(
-                f"{name:<10}"
-                f"{cnt:>10}"
-                f"{delta:>12}"
-                f"{compression:>11.2f}×"
-            )
+            print(f"{name:<10}" f"{cnt:>10}" f"{delta:>12}" f"{compression:>11.2f}×")
 
         prev = cnt
 
@@ -686,34 +632,18 @@ def pretty_print_time(stage_time: list[tuple[str, float]]):
     out = []
     for stage, cost in rows:
         percent = (cost / total_time * 100) if total_time > 0 else 0.0
-        out.append({
-            "name": stage,
-            "time": round(cost, 2),
-            "percent": round(percent, 2)
-        })
+        out.append({"name": stage, "time": round(cost, 2), "percent": round(percent, 2)})
         if PRINT_FLAG:
-            print(
-                f"{stage.ljust(name_width)} | "
-                f"{cost * 1000:9.2f} | "
-                f"{percent:7.2f}%"
-            )
+            print(f"{stage.ljust(name_width)} | " f"{cost * 1000:9.2f} | " f"{percent:7.2f}%")
     if PRINT_FLAG:
         print("-" * (name_width + 36))
 
     true_percent = (total_time_without_debug / total_time * 100) if total_time > 0 else 0.0
 
     if PRINT_FLAG:
-        print(
-            f"{'True'.ljust(name_width)} | "
-            f"{total_time_without_debug * 1000:9.2f} | "
-            f"{true_percent:7.2f}%"
-        )
+        print(f"{'True'.ljust(name_width)} | " f"{total_time_without_debug * 1000:9.2f} | " f"{true_percent:7.2f}%")
 
-        print(
-            f"{'Total'.ljust(name_width)} | "
-            f"{total_time * 1000:9.2f} | "
-            f"{100.00:7.2f}%"
-        )
+        print(f"{'Total'.ljust(name_width)} | " f"{total_time * 1000:9.2f} | " f"{100.00:7.2f}%")
 
     return {
         "stages": out,
@@ -723,19 +653,17 @@ def pretty_print_time(stage_time: list[tuple[str, float]]):
 
 
 def pretty_print_image_token(
-        screenshot: Image.Image,
-        compacted_img: Image.Image,
-        model_id: str,
+    screenshot: Image.Image,
+    compacted_img: Image.Image,
+    model_id: str,
 ):
-    raw_token, raw_resized_size = estimate_image_tokens(
-        screenshot.size[0], screenshot.size[1], model_id
-    )
+    raw_token, raw_resized_size = estimate_image_tokens(screenshot.size[0], screenshot.size[1], model_id)
     compacted_token, compacted_resized_size = estimate_image_tokens(
         compacted_img.size[0], compacted_img.size[1], model_id
     )
 
     token_diff = raw_token - compacted_token
-    compression_ratio = raw_token / compacted_token if compacted_token != 0 else float('inf')
+    compression_ratio = raw_token / compacted_token if compacted_token != 0 else float("inf")
 
     def fmt_size(size: tuple[float, float]) -> str:
         return f"{size[0]:.1f} x {size[1]:.1f}"
@@ -770,11 +698,7 @@ def pretty_print_image_token(
 
         sign = "+" if token_diff > 0 else ""
 
-        print(
-            f"{'Δ Token':<12} | "
-            f"{sign}{token_diff:,} | "
-            f"Compression: {compression_ratio:.2f}x"
-        )
+        print(f"{'Δ Token':<12} | " f"{sign}{token_diff:,} | " f"Compression: {compression_ratio:.2f}x")
 
     return {
         "original": {
@@ -786,7 +710,7 @@ def pretty_print_image_token(
             "size": compacted_img.size,
         },
         "token_reduction": token_diff,
-        "compression_ratio": compression_ratio
+        "compression_ratio": compression_ratio,
     }
 
 

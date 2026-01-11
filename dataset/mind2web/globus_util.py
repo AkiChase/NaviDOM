@@ -25,19 +25,14 @@ def auth_load():
     with open("globus_tokens.json", "r") as f:
         saved_tokens = json.load(f)
 
-    authorizer = RefreshTokenAuthorizer(
-        refresh_token=saved_tokens["refresh_token"],
-        auth_client=auth_client
-    )
+    authorizer = RefreshTokenAuthorizer(refresh_token=saved_tokens["refresh_token"], auth_client=auth_client)
 
     transfer_client = TransferClient(authorizer=authorizer)
     return transfer_client
 
 
 def globus_download(transfer_client: TransferClient, src_id: str, dest_id: str, data_items: list[tuple[str, str]]):
-    task_data = globus_sdk.TransferData(
-        source_endpoint=src_id, destination_endpoint=dest_id
-    )
+    task_data = globus_sdk.TransferData(source_endpoint=src_id, destination_endpoint=dest_id)
 
     for item in data_items:
         task_data.add_item(*item)
@@ -45,18 +40,3 @@ def globus_download(transfer_client: TransferClient, src_id: str, dest_id: str, 
     task_doc = transfer_client.submit_transfer(task_data)
     task_id = task_doc["task_id"]
     logger.info(f"submitted transfer, task_id={task_id}")
-
-
-if __name__ == "__main__":
-    def main():
-        source_collection_id = "32e6b738-a0b0-47f8-b475-26bf1c5ebf19"  # mind2web
-        dest_collection_id = "20743934-e559-11f0-86b8-0eb0b913a0ab"  # 本地端点
-        # auth_save()
-        transfer_client = auth_load()
-        globus_download(
-            transfer_client, source_collection_id, dest_collection_id,
-            [("/data/raw_dump/task/000ada18-5007-4fd4-8a12-8987ba543d31/processed/snapshots/",
-              "/~/D/globus/mind2web/000ada18-5007-4fd4-8a12-8987ba543d31")])
-
-
-    main()
