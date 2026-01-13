@@ -1,3 +1,4 @@
+from datetime import datetime
 from io import BytesIO
 import os
 import platform
@@ -75,3 +76,10 @@ def load_default_font(font_size: int):
 
 def gen_uid():
     return uuid.uuid4().hex
+
+
+def time_stamp(now: datetime | None = None):
+    # YYYY/MM/DD-HH:MM:SS
+    if not now:
+        now = datetime.now()
+    return now.strftime("%Y/%m/%d-%H:%M:%S")

@@ -1,10 +1,16 @@
 import asyncio
+from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from agent.config import Config
 from agent.dom_utils import DomNode
 from playwright.async_api import Page, CDPSession
+
+from agent.llm import ChatImageDetails, ChatTextDetails
+from agent.utils import time_stamp
 
 
 class ActionType(Enum):
@@ -18,44 +24,59 @@ class ActionType(Enum):
     Press = "PRESS"
 
 
-class ActionRecord:
-    # TODO 记录action的操作和当时的DOM、截图等等
-    pass
-
-
 class Action:
     uid: str
     type: ActionType
     target: DomNode | None
-    extra: Any
+    extra: dict
 
-    def __init__(self, uid: str, action_type: ActionType, target: DomNode | None, extra: Any):
+    def __init__(self, uid: str, action_type: ActionType, target: DomNode | None, extra: dict):
         self.uid = uid
         self.type = action_type
         self.target = target
         self.extra = extra
 
     @staticmethod
-    def from_json(uid: str, json_obj: dict, dom_nodes: list[DomNode]) -> "Action":
-        action_type = ActionType(json_obj["type"])
+    def get_format_prompt():
+        prompt = [
+            "CLICK, <backend_node_id>",
+            "INPUT, <backend_node_id>, <clear:true|false>, <text>\t// In <text>, only \\n has special meaning for line breaks; no other escaping is required.",
+            "SCROLL, <up|down>\t// Move exactly one page (down +1, up -1)",
+            "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
+        ]
+        return "\n".join(prompt)
 
-        target = None
-        if action_type in [ActionType.Click, ActionType.Input]:
-            target_id = json_obj["backend_node_id"]
+    @staticmethod
+    def from_raw_action(uid: str, csv_line: str, dom_nodes: list[DomNode]) -> "Action":
+        csv_line = csv_line.strip()
+        assert csv_line, "Empty action line"
+
+        parts = [p.strip() for p in csv_line.split(",", maxsplit=1)]
+        action_type = ActionType(parts[0].upper())
+
+        def find_target(backend_node_id: str) -> DomNode:
+            target_id = int(backend_node_id.strip("[]<>"))
             for node in dom_nodes:
                 target = node.find_nodes_by_backend_node_ids([target_id])[0]
                 if target is not None:
-                    break
-            assert target is not None
+                    return target
+            raise AssertionError(f"backend_node_id {target_id} not found in dom_nodes")
 
         if action_type == ActionType.Click:
-            return Action(uid, action_type, target, None)
+            # CLICK, <backend_node_id>
+            assert len(parts) == 2, f"Invalid CLICK format: {csv_line}"
+            target = find_target(parts[1])
+            return Action(uid, action_type, target, {})
         elif action_type == ActionType.Input:
-            clear = json_obj["clear"]
-            if not isinstance(clear, bool):
-                assert isinstance(clear, str)
-                assert clear.lower() in ["true", "false"]
-                clear = clear.lower() == "true"
+            # INPUT, <backend_node_id>, <clear>, <text>
+            assert len(parts) == 2, f"Invalid INPUT format: {csv_line}"
+            sub_parts = [p.strip() for p in parts[1].split(",", maxsplit=2)]
+            assert len(sub_parts) == 3, f"Invalid INPUT format: {csv_line}"
+            clear_raw = sub_parts[1].lower()
+            assert clear_raw in ("true", "false"), f"Invalid clear value: {clear_raw}"
+            clear = clear_raw == "true"
+            text = sub_parts[2].replace("\\n", "\n")
+            target = find_target(sub_parts[0])
 
             return Action(
                 uid,
@@ -63,20 +84,23 @@ class Action:
                 target,
                 {
                     "clear": clear,
-                    "text": json_obj["text"],
+                    "text": text,
                 },
             )
         elif action_type == ActionType.Scroll:
-            direction = json_obj["direction"]
-            assert isinstance(direction, str)
-            assert direction.lower() in ["up", "down"]
-            direction = "down" if direction.lower() == "down" else "up"
-            return Action(uid, action_type, target, direction)
+            # SCROLL, <up|down>
+            assert len(parts) == 2, f"Invalid SCROLL format: {csv_line}"
+            direction = parts[1].lower()
+            assert direction in ("up", "down"), f"Invalid scroll direction: {direction}"
+            return Action(uid, action_type, None, {"direction": direction})
         elif action_type == ActionType.Press:
-            key = json_obj["key"]
-            return Action(uid, action_type, target, key)
+            # PRESS, <KeyboardEvent.key>
+            assert len(parts) == 2, f"Invalid PRESS format: {csv_line}"
+            key = parts[1]
+            return Action(uid, action_type, None, {"key": key})
 
-        raise NotImplementedError
+        else:
+            raise AssertionError(f"Unsupported action type: {action_type}")
 
     async def execute(self, page: Page, cdp_session: CDPSession) -> None:
         # 简单实现
@@ -105,6 +129,7 @@ class Action:
                 await cdp_session.send(
                     "Runtime.callFunctionOn",
                     {
+                        "objectId": object_id,
                         "functionDeclaration": """function() {
                         try { this.select(); } catch (e) {}
                         <Mask>
@@ -117,8 +142,27 @@ class Action:
                 )
         elif self.type == ActionType.Scroll:
             dy = Config.browser_viewport_h
-            if self.extra == "up":
+            direction = self.extra["direction"]
+            if direction == "up":
                 dy = -dy
             await page.evaluate(f"window.scrollBy(0, {dy});")
         elif self.type == ActionType.Press:
-            await page.keyboard.press(self.extra)
+            key = self.extra["key"]
+            await page.keyboard.press(key)
+
+
+@dataclass
+class ActionDetails:
+    action: Action
+    raw_action: str
+    execute_time: datetime
+    action_screenshot_path: Path
+    result_screenshot_path: Path
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "raw_action": self.raw_action,
+            "execute_time": time_stamp(self.execute_time),
+            "action_screenshot_path": str(self.action_screenshot_path),
+            "result_screenshot_path": str(self.result_screenshot_path),
+        }

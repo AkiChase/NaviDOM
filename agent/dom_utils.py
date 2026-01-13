@@ -53,9 +53,8 @@ class Viewport:
         self.page_index_x = math.floor(self.page_y / self.client_h) + 1
 
     def get_page_info(self) -> str:
-        x = f"Landscape page: {self.page_index_x}/{self.page_count_x}" if self.page_count_x > 1 else ""
-        y = f"Vertical page: {self.page_index_y}/{self.page_count_y}" if self.page_count_y > 1 else ""
-        return f"{x} {y}".strip()
+        y = f"Y Page: {self.page_index_y}/{self.page_count_y}" if self.page_count_y > 1 else ""
+        return f"{y}".strip()
 
 
 class DomNode:

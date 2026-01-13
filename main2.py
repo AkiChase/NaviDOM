@@ -4,7 +4,7 @@ import shutil
 from playwright.async_api import async_playwright
 
 from agent.config import Config
-from agent.run import Agent
+from agent.agent import Agent
 
 
 async def main():
@@ -23,7 +23,7 @@ async def main():
         if out_dir.exists():
             shutil.rmtree(out_dir)
         agent = Agent(out_dir=out_dir)
-        await agent.run(context, "点击手气不错的按钮")
+        await agent.run(context, "visit https://www.google.com/ and search for doubao")
         pass
 
 
