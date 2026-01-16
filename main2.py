@@ -22,8 +22,14 @@ async def main():
         out_dir = Path("output/test")
         if out_dir.exists():
             shutil.rmtree(out_dir)
-        agent = Agent(out_dir=out_dir)
-        await agent.run(context, "visit https://www.google.com/ and search for doubao")
+        task = "Go to https://www.traderjoes.com/. Find the store location and hours of the closest Trader Joe's to zip code 90028 and set it as my home store."
+        # task = "在github网站上查找浏览器自动化相关的star数量最高的项目，给出url"
+        agent = Agent(
+            out_dir=out_dir,
+            context=context,
+            user_request=task,
+        )
+        await agent.run()
         pass
 
 

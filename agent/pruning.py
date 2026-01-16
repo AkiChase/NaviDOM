@@ -121,13 +121,13 @@ class Pruning:
     @staticmethod
     async def determine_cluster_related(nodes: list[DomNode], image: Image.Image, task: str):
         prompt = f"""
-    You are an experienced UI automation testing developer.
-    You need to determine whether the UI elements in the current region screenshot could be related to "{task}".
-    You should make this judgment based on the DOM elements list provided below and the corresponding UI screenshot (the relevant elements are highlighted with red boxes).
-    If there is any potential relationship, output Yes; if they are completely unrelated, output No. Do not output any other text.
+You are an experienced UI automation testing developer.
+You need to determine whether the UI elements in the current region screenshot could be related to "{task}".
+You should make this judgment based on the DOM elements list provided below and the corresponding UI screenshot (the relevant elements are highlighted with red boxes).
+If there is any potential relationship, output Yes; if they are completely unrelated, output No. Do not output any other text.
 
-    DOM elements:
-    {'\n\n'.join([node.get_human_tree_repr(no_end=True, no_id=True) for node in nodes])}
+DOM elements:
+{'\n\n'.join([node.get_human_tree_repr(no_end=True, no_id=True) for node in nodes])}
     """.strip()
 
         # resized_image = dom_image.copy().resize((round(dom_image.size[0] * 0.75), round(dom_image.size[1] * 0.75)))
@@ -172,7 +172,6 @@ class Pruning:
 
         root.children = retained_children
         return _filter_dom_node(root)
-
 
     @staticmethod
     def clean_dom_tree_attrs(root: DomNode):
@@ -227,6 +226,34 @@ class Pruning:
         for child in root.children:
             Pruning.merge_dom_tree_children(child)
 
+    @staticmethod
+    def extract_dom_tree_text(root: DomNode) -> str:
+        lines = _extract_text_dom(root)
+        return "\n".join(lines)
+
+
+def _extract_text_dom(
+    node: DomNode,
+    indent: int = 0,
+    indent_unit: str = "  ",
+) -> list[str]:
+    lines: list[str] = []
+
+    if node.node_type == NodeType.TEXT_NODE:
+        text = (node.node_value or "").strip()
+        if text:
+            lines.append(f"{indent_unit * indent}{text}")
+        return lines
+
+    child_lines: list[str] = []
+    for child in node.children:
+        child_lines.extend(_extract_text_dom(child, indent + 1, indent_unit))
+
+    if child_lines:
+        lines.extend(child_lines)
+
+    return lines
+
 
 def _filter_dom_node(node: DomNode) -> bool:
     """
@@ -235,7 +262,7 @@ def _filter_dom_node(node: DomNode) -> bool:
     """
 
     # 如果节点在支持列表中，保留
-    if node.local_name in SUPPORT_ELEMENTS:
+    if node.local_name in SUPPORT_ELEMENTS or node.node_type == NodeType.TEXT_NODE:
         return True
 
     # 如果有子节点也保留（作为容器）
@@ -243,6 +270,7 @@ def _filter_dom_node(node: DomNode) -> bool:
         return True
 
     return False
+
 
 IMPORTANT_ATTRS = {
     "id",

@@ -113,6 +113,21 @@ class DomNode:
     def __repr__(self):
         return f"<DomNode {self.local_name} backend_node_id={self.backend_node_id}>"
 
+    def get_description(self) -> str:
+
+        def collect_text(node: "DomNode") -> list[str]:
+            out: list[str] = []
+            if node.node_type == NodeType.TEXT_NODE:
+                out.append(node.node_value)
+
+            for child in node.children:
+                out.extend(collect_text(child))
+            return out
+
+        text = collect_text(self)
+        content = f'({" ".join(text)})' if text else ""
+        return f"{self.local_name}{content}"
+
     def max_bounds(self) -> tuple[float, float, float, float] | None:
         bounds_list: list[tuple[float, float, float, float]] = []
 

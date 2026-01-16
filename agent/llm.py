@@ -7,17 +7,29 @@ from PIL.Image import Image
 
 
 class ChatTextDetails(TypedDict):
+    prompt: str
+    model: str
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
     content: str
-    time_cost: float
+    total_time: float
+    tps: float
+    ttft: float
 
 
-class ChatImageDetails(ChatTextDetails):
+class ImageDetails(TypedDict):
     image_format: str
     image_size: tuple[int, int]
     image_bytes: int
+
+
+class ChatImageDetails(ChatTextDetails, ImageDetails):
+    pass
+
+
+class ChatImageListDetails(ChatTextDetails):
+    image_list: list[ImageDetails]
 
 
 def image_to_base64(image: Image, default_fmt="JPEG") -> dict:
@@ -58,7 +70,7 @@ class PrimaryLLM:
         cls.tokenDict = {}
 
     @classmethod
-    async def chat_detail(cls, prompt: str, **kwargs) -> ChatTextDetails:
+    async def chat_with_text_detail(cls, prompt: str, **kwargs) -> ChatTextDetails:
         params = {
             "model": cls.text_model,
             "messages": [
@@ -70,24 +82,53 @@ class PrimaryLLM:
                 }
             ],
             "temperature": cls.temperature,
+            "stream": True,
+            "stream_options": {
+                "include_usage": True,
+                "include_obfuscation": False,
+            },
             **kwargs,
         }
 
+        start_time = time.time()
+        first_token_time = None
+        full_content = []
+        usage = None
+
         try:
-            start_time = time.time()
-            completion = await cls.client.chat.completions.create(**params)
-            time_cost = time.time() - start_time
+            stream = await cls.client.chat.completions.create(**params)
+            async for chunk in stream:
+                if chunk.choices == [] and chunk.usage is not None:
+                    usage = chunk.usage
+                    continue
+
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                    full_content.append(delta.content)
+
+            assert first_token_time is not None
+            assert usage is not None
         except Exception as e:
             raise Exception(f"LLM async request failed: {e}")
 
-        usage = completion.usage
-        res = completion.choices[0].message.content
+        end_time = time.time()
+
+        completion_tokens = usage.completion_tokens
+        prompt_tokens = usage.prompt_tokens
+        total_tokens = usage.total_tokens
+
         return {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-            "content": res,
-            "time_cost": time_cost,
+            "prompt": prompt,
+            "model": cls.text_model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "content": "".join(full_content),
+            "total_time": end_time - start_time,
+            "ttft": first_token_time - start_time,
+            "tps": completion_tokens / (end_time - first_token_time),
         }
 
     @classmethod
@@ -106,31 +147,131 @@ class PrimaryLLM:
                 }
             ],
             "temperature": cls.temperature,
+            "stream": True,
+            "stream_options": {
+                "include_usage": True,
+                "include_obfuscation": False,
+            },
             **kwargs,
         }
 
+        start_time = time.time()
+        first_token_time = None
+        full_content = []
+        usage = None
+
         try:
-            start_time = time.time()
-            completion = await cls.client.chat.completions.create(**params)
-            time_cost = time.time() - start_time
+            stream = await cls.client.chat.completions.create(**params)
+            async for chunk in stream:
+                if chunk.choices == [] and chunk.usage is not None:
+                    usage = chunk.usage
+                    continue
+
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                    full_content.append(delta.content)
+
+            assert first_token_time is not None
+            assert usage is not None
         except Exception as e:
             raise Exception(f"LLM async request failed: {e}")
 
-        if not completion.choices:
-            raise Exception("LLM async response nothing")
+        end_time = time.time()
 
-        usage = completion.usage
-        res = completion.choices[0].message.content
+        completion_tokens = usage.completion_tokens
+        prompt_tokens = usage.prompt_tokens
+        total_tokens = usage.total_tokens
 
         return {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-            "content": res,
-            "time_cost": time_cost,
+            "prompt": prompt,
+            "model": cls.image_model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "content": "".join(full_content),
+            "total_time": end_time - start_time,
+            "ttft": first_token_time - start_time,
+            "tps": completion_tokens / (end_time - first_token_time),
             "image_format": base64_res["format"],
             "image_size": base64_res["size"],
             "image_bytes": base64_res["bytes"],
+        }
+
+    @classmethod
+    async def chat_with_image_list_detail(
+        cls, prompt: str, image_list: list[Image], default_fmt="JPEG", **kwargs
+    ) -> ChatImageListDetails:
+        base64_res_list = [image_to_base64(image, default_fmt) for image in image_list]
+
+        params = {
+            "model": cls.image_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        *[{"type": "image_url", "image_url": {"url": b["base64"]}} for b in base64_res_list],
+                    ],
+                }
+            ],
+            "temperature": cls.temperature,
+            "stream": True,
+            "stream_options": {
+                "include_usage": True,
+                "include_obfuscation": False,
+            },
+            **kwargs,
+        }
+
+        start_time = time.time()
+        first_token_time = None
+        full_content = []
+        usage = None
+
+        try:
+            stream = await cls.client.chat.completions.create(**params)
+            async for chunk in stream:
+                if chunk.choices == [] and chunk.usage is not None:
+                    usage = chunk.usage
+                    continue
+
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                    full_content.append(delta.content)
+
+            assert first_token_time is not None
+            assert usage is not None
+        except Exception as e:
+            raise Exception(f"LLM async request failed: {e}")
+
+        end_time = time.time()
+
+        completion_tokens = usage.completion_tokens
+        prompt_tokens = usage.prompt_tokens
+        total_tokens = usage.total_tokens
+
+        return {
+            "prompt": prompt,
+            "model": cls.image_model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "content": "".join(full_content),
+            "total_time": end_time - start_time,
+            "ttft": first_token_time - start_time,
+            "tps": completion_tokens / (end_time - first_token_time),
+            "image_list": [
+                {
+                    "image_format": b["format"],
+                    "image_size": b["size"],
+                    "image_bytes": b["bytes"],
+                }
+                for b in base64_res_list
+            ],
         }
 
 

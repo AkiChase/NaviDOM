@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 import os
 import platform
@@ -7,6 +7,15 @@ import uuid
 from PIL import ImageDraw, ImageFont, Image
 from loguru import logger
 from playwright.async_api import Page
+from urllib.parse import quote
+
+
+class SpecialException(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+    def __str__(self) -> str:
+        return self.args[0]
 
 
 Color = Union[str, Tuple[int, int, int], Tuple[int, int, int, int]]
@@ -83,3 +92,28 @@ def time_stamp(now: datetime | None = None):
     if not now:
         now = datetime.now()
     return now.strftime("%Y/%m/%d-%H:%M:%S")
+
+
+def format_time_delta(start: datetime | float, end: datetime | float, with_ms: bool = True) -> str:
+    if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+        delta_seconds = end - start
+        delta = timedelta(seconds=delta_seconds)
+    elif isinstance(start, datetime) and isinstance(end, datetime):
+        delta = end - start
+    else:
+        raise TypeError("start and end must be both datetime or both float")
+
+    total_seconds = int(delta.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if with_ms:
+        milliseconds = int(delta.microseconds / 1000)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+    else:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def google_search_url(keywords: str) -> str:
+    encoded = quote(keywords, safe="")
+    return f"https://www.google.com/search?q={encoded}"

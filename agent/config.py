@@ -12,6 +12,8 @@ class Config:
     browser_executable_path: str | None
     browser_viewport_w: int
     browser_viewport_h: int
+    max_act_retry_times: int
+    max_iteration_times: int
 
     @classmethod
     def init(cls, env_path: str):
@@ -30,6 +32,8 @@ class Config:
         viewport = browser_config.get("viewport", {})
         cls.browser_viewport_w = viewport.get("width", 1280)
         cls.browser_viewport_h = viewport.get("height", 720)
+        cls.max_act_retry_times = env.get("max_act_retry_times", 3)
+        cls.max_iteration_times = env.get("max_iteration_times", 15)
 
         primary_llm_service = env["primary_llm_service"]
         secondary_llm_service = env["secondary_llm_service"]
@@ -39,14 +43,14 @@ class Config:
         PrimaryLLM.init(
             api_key=primary_llm_config["api_key"],
             base_url=primary_llm_config["base_url"],
-            temperature=0.0,
+            temperature=primary_llm_config["temperature"],
             text_model=primary_llm_config["text_model"],
             image_model=primary_llm_config["image_model"],
         )
         SecondaryLLM.init(
             api_key=secondary_llm_config["api_key"],
             base_url=secondary_llm_config["base_url"],
-            temperature=0.0,
+            temperature=primary_llm_config["temperature"],
             text_model=secondary_llm_config["text_model"],
             image_model=secondary_llm_config["image_model"],
         )

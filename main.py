@@ -88,7 +88,7 @@ async def main():
                         context, annotation_id, action_uid, bounding_box, last_action_pos, data_path
                     )
 
-                    out_dir_path = Path(f"out/{annotation_id}/{time_stamp()}_{a_index + 1:02}_{action_uid}")
+                    out_dir_path = Path(f"out/{annotation_id}/{time_stamp()}_{a_index + 1:03}_{action_uid}")
                     out_dir_path.mkdir(parents=True, exist_ok=True)
                     last_action_pos = await evaluate(
                         page, annotation_id, confirmed_task, action_uid, target_bounds, out_dir_path
