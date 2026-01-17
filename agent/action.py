@@ -40,7 +40,7 @@ action_format_prompt = {
     ActionType.Scroll: "SCROLL, <up|down>\t// Move exactly one page (down +1, up -1)",
     ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.Memory: "MEMORY, <label>, <content>\t// If the user request requires certain information to be output, store <content> under a semantic <label> using this action. After task completion, all stored MEMORY contents will be refined and returned to the user",
-    ActionType.Extract: "EXTRACT, <label>, <instruction>\t// Extract information from the current UI page according to the natural-language instruction. The extracted result will be stored in MEMORY under the semantic <label>",
+    ActionType.Extract: "EXTRACT, <label>, <instruction>\t// Extract information from current UI page according to <instruction>, and store the result in MEMORY under <label>. When extracting multiple items, do NOT split them into multiple EXTRACT actions; combine them into a single EXTRACT action whenever possible",
     ActionType.Navigate: "NAVIGATE, <url>\t// Navigate to the specified URL",
     ActionType.Search: "SEARCH, <keywords>\t// Navigate to Google search results for the given keywords",
 }
@@ -167,45 +167,58 @@ class Action:
         node = None
         if self.type in [ActionType.Click, ActionType.Input]:
             assert self.target is not None
-            node = await cdp_session.send("DOM.resolveNode", {"backendNodeId": self.target.backend_node_id})
-            if "object" not in node or "objectId" not in node["object"]:
-                raise ActionExecuteException("Failed to get object ID for element")
-            object_id = node["object"]["objectId"]
 
             if self.type == ActionType.Click:
-                await cdp_session.send(
-                    "Runtime.callFunctionOn",
-                    {
-                        "objectId": object_id,
-                        "functionDeclaration": "function() {this.click();}",
-                    },
-                )
+                loc = await self.target.find_node_in_page(page)
+                if loc is not None:
+                    await loc.click(timeout=100)
+                else:
+                    node = await cdp_session.send("DOM.resolveNode", {"backendNodeId": self.target.backend_node_id})
+                    if "object" not in node or "objectId" not in node["object"]:
+                        raise ActionExecuteException("Failed to get object ID for element")
+                    object_id = node["object"]["objectId"]
+                    await cdp_session.send(
+                        "Runtime.callFunctionOn",
+                        {
+                            "objectId": object_id,
+                            "functionDeclaration": "function() {this.click();}",
+                        },
+                    )
                 await asyncio.sleep(1)
             elif self.type == ActionType.Input:
-                # TODO 完全照抄吧，目前这样不会触发修改
                 clear = self.extra["clear"]
                 text = self.extra["text"]
-                await cdp_session.send("DOM.focus", {"objectId": object_id})
-
-                if clear:
-                    value_stmt = "try { this.select(); } catch (e) {}\n"
-                    value_stmt += f'this.value = "{text}";'
+                loc = await self.target.find_node_in_page(page)
+                if loc is not None:
+                    if clear:
+                        await loc.fill(text, timeout=100)
+                    else:
+                        await loc.type(text, timeout=100)
                 else:
-                    value_stmt = f'this.value += "{text}";'
+                    node = await cdp_session.send("DOM.resolveNode", {"backendNodeId": self.target.backend_node_id})
+                    if "object" not in node or "objectId" not in node["object"]:
+                        raise ActionExecuteException("Failed to get object ID for element")
+                    object_id = node["object"]["objectId"]
+                    await cdp_session.send("DOM.focus", {"objectId": object_id})
+                    if clear:
+                        value_stmt = "try { this.select(); } catch (e) {}\n"
+                        value_stmt += f'this.value = "{text}";'
+                    else:
+                        value_stmt = f'this.value += "{text}";'
 
-                await cdp_session.send(
-                    "Runtime.callFunctionOn",
-                    {
-                        "objectId": object_id,
-                        "functionDeclaration": """function() {
-                        <Mask>
-                        this.dispatchEvent(new Event("input", { bubbles: true }));
-                        this.dispatchEvent(new Event("change", { bubbles: true }));
-                    }""".replace(
-                            "<Mask>", value_stmt
-                        ),
-                    },
-                )
+                    await cdp_session.send(
+                        "Runtime.callFunctionOn",
+                        {
+                            "objectId": object_id,
+                            "functionDeclaration": """function() {
+                            <Mask>
+                            this.dispatchEvent(new Event("input", { bubbles: true }));
+                            this.dispatchEvent(new Event("change", { bubbles: true }));
+                        }""".replace(
+                                "<Mask>", value_stmt
+                            ),
+                        },
+                    )
                 await asyncio.sleep(1)
         elif self.type == ActionType.Scroll:
             dy = Config.browser_viewport_h
@@ -271,7 +284,7 @@ Your task is to extract only the information that is explicitly requested in the
 
 class ActionExecuteResult(TypedDict):
     success: bool
-    additional: ChatImageDetails | None | str
+    additional: ChatImageDetails | None | str  # Extract/Other/Error
 
 
 @dataclass

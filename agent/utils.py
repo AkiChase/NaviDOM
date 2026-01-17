@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 import os
 import platform
+import re
 from typing import Union, Tuple
 import uuid
 from PIL import ImageDraw, ImageFont, Image
@@ -81,6 +82,46 @@ def load_default_font(font_size: int):
         logger.warning("Font not found: {}. Use default font instead.", font_path)
         return ImageFont.load_default(size=font_size)
     return ImageFont.truetype(font_path, size=font_size)
+
+
+css_ident_re = re.compile(r"^-?[_a-zA-Z][_a-zA-Z0-9-]*$")
+
+
+def css_escape(value: str) -> str:
+    """
+    Escape a string so it can be safely used in a CSS selector.
+    This is a simplified but practical implementation.
+    """
+    if css_ident_re.match(value):
+        return value
+
+    result = []
+    for i, ch in enumerate(value):
+        code = ord(ch)
+
+        # NULL
+        if ch == "\0":
+            result.append("\ufffd")
+            continue
+
+        # control chars or non-ASCII
+        if code < 0x20 or code > 0x7E:
+            result.append(f"\\{code:X} ")
+            continue
+
+        # special CSS chars
+        if ch in r' !"#$%&\'()*+,./:;<=>?@[\]^`{|}~':
+            result.append(f"\\{ch}")
+            continue
+
+        # identifier starting with digit
+        if i == 0 and ch.isdigit():
+            result.append(f"\\{code:X} ")
+            continue
+
+        result.append(ch)
+
+    return "".join(result)
 
 
 def gen_uid():

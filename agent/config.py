@@ -16,10 +16,14 @@ class Config:
     max_iteration_times: int
 
     @classmethod
-    def init(cls, env_path: str):
+    def init(cls, env_path: str, out_dir: Path):
         logger.remove()
         logger.add(
             sys.stdout,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+        )
+        logger.add(
+            out_dir / "log.log",
             format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
         )
 

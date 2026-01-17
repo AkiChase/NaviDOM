@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
+from typing import Literal
 
 from agent.action import ActionDetails
 from agent.llm import ChatImageDetails, ChatImageListDetails, ChatTextDetails
@@ -15,11 +16,18 @@ class Record:
 class TimeLine:
     content: list[tuple[str, float]]
 
-    def __init__(self, label: str = "start", time_point: float = time.time()):
+    def __init__(self, label: str = "start", time_point: float | None = None):
+        if time_point is None:
+            time_point = time.time()
         self.content = [(label, time_point)]
 
-    def add(self, label: str, time_point: float = time.time()):
+    def add(self, label: str, time_point: float | None = None):
+        if time_point is None:
+            time_point = time.time()
         self.content.append((label, time_point))
+
+    def total_time(self) -> float:
+        return self.content[-1][1] - self.content[0][1]
 
 
 @dataclass
@@ -29,6 +37,7 @@ class PlanningRecord(Record):
     nearest_next_objective: str
     future_plan: str
     task_completed: bool
+    time_line: TimeLine
 
     def save(self, out_dir: Path):
         with open(out_dir / f"{self.index:03}_planning.json", "w", encoding="utf-8") as f:

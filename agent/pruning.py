@@ -24,6 +24,14 @@ GROUP_ELEMENTS = {
     # 'section',
 }
 
+FORCE_REMOVE_ELEMENTS = {
+    "script",
+    "style",
+    "meta",
+    "link",
+    "title",
+}
+
 SUPPORT_ELEMENTS = {
     # ========= 文档 / 布局语义 =========
     "html",
@@ -144,27 +152,27 @@ DOM elements:
     @staticmethod
     def trim_dom_tree_by_visibility(root: DomNode, viewport: Viewport):
         def post_order(node: DomNode) -> bool:
-            if not node.style_visible:
-                return False
+            kept_children = []
+            for child in node.children:
+                if post_order(child):
+                    kept_children.append(child)
 
-            if not node.children:
-                return node.is_overlap_viewport(viewport)
+            node.children = kept_children
 
-            node.children = [child for child in node.children if post_order(child)]
+            self_visible = (
+                node.style_visible and
+                node.is_overlap_viewport(viewport)
+            )
 
-            if node.is_overlap_viewport(viewport) and node.style_visible:
-                return True
-
-            # Keep the node if it still has any children
-            if node.children:
-                return True
-
-            return False
+            return self_visible or bool(node.children)
 
         post_order(root)
 
     @staticmethod
     def filter_dom_tree_by_node(root: DomNode):
+        if root.local_name in FORCE_REMOVE_ELEMENTS:
+            return False
+
         retained_children = []
         for child in root.children:
             if Pruning.filter_dom_tree_by_node(child):  # 递归剪枝子树
@@ -219,9 +227,10 @@ DOM elements:
                     recur(c)
 
             recur(root)
-            root.node_value = " ".join(new_value)
-            root.node_type = NodeType.TEXT_NODE
-            root.children = []
+            merged_child = root.children[0]
+            merged_child.node_value = " ".join(new_value)
+            merged_child.children = []
+            root.children = [merged_child]
 
         for child in root.children:
             Pruning.merge_dom_tree_children(child)
@@ -260,7 +269,6 @@ def _filter_dom_node(node: DomNode) -> bool:
     Decide whether this DOM node should be retained in the DOM tree
     过滤特定类型的一些节点
     """
-
     # 如果节点在支持列表中，保留
     if node.local_name in SUPPORT_ELEMENTS or node.node_type == NodeType.TEXT_NODE:
         return True
@@ -317,7 +325,9 @@ def _promote_dom_node_children(node: DomNode) -> bool:
     Decide whether this node should be removed and its children promoted
     当节点的边界等于父节点的边界时
     """
-    if node.parent is None:
+
+    # 根节点和文本节点不处理
+    if node.parent is None or node.node_type == NodeType.TEXT_NODE:
         return False
 
     if node.local_name in {"html", "body"}:
@@ -332,9 +342,9 @@ def _promote_dom_node_children(node: DomNode) -> bool:
 def _merge_dom_node_children(node: DomNode) -> bool:
     """
     Decide whether this subtree should be merged into a single DOM node
-    当所有孩子都是文本节点时
+    当孩子都是文本节点且数量大于1时
     """
-    if node.children and all([child.node_type == NodeType.TEXT_NODE for child in node.children]):
+    if len(node.children) > 1 and all([child.node_type == NodeType.TEXT_NODE for child in node.children]):
         return True
 
     return False

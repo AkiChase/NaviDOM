@@ -2,13 +2,16 @@ import itertools
 import math
 from collections import defaultdict, deque
 from enum import IntEnum
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
+from playwright.async_api import Page
 
 import tiktoken
 from PIL import ImageFont, ImageDraw, Image
+
+from agent.utils import css_escape
 
 tiktoken_enc = tiktoken.get_encoding("o200k_base")
 default_font = ImageFont.load_default()
@@ -39,7 +42,7 @@ class Viewport:
     page_count_x: int
     page_index_x: int
 
-    def __init__(self, viewport: Dict[str, Any]):
+    def __init__(self, viewport: dict[str, Any]):
         self.page_x = viewport["cssLayoutViewport"]["pageX"]
         self.page_y = viewport["cssLayoutViewport"]["pageY"]
         self.client_w = viewport["cssLayoutViewport"]["clientWidth"]
@@ -63,20 +66,21 @@ class DomNode:
     local_name: str
     node_value: str
     repr_value: str
-    attributes: Dict[str, str]
-    repr_attributes: Dict[str, str]
-    children: List["DomNode"]
+    attributes: dict[str, str]
+    repr_attributes: dict[str, str]
+    children: list["DomNode"]
     parent: "DomNode | None"
     bounds: tuple[float, float, float, float] | None  # (x1, y1, x2, y2)
     style_visible: bool
     level: int  # depth
 
-    def __init__(self, node: Dict[str, Any], parent: "DomNode | None" = None, bounds_dict=None, visible_dict=None):
-        if bounds_dict is None:
-            bounds_dict = {}
-        if visible_dict is None:
-            visible_dict = {}
-
+    def __init__(
+        self,
+        node: dict[str, Any],
+        parent: "DomNode | None",
+        bounds_dict: dict[int, tuple[float, float, float, float]],
+        visible_dict: dict[int, bool],
+    ):
         self.backend_node_id = node.get("backendNodeId", -1)
         self.node_type = NodeType(node["nodeType"])
         self.local_name = node.get("localName", "")
@@ -98,9 +102,9 @@ class DomNode:
         if self.backend_node_id in visible_dict:
             self.style_visible = visible_dict[self.backend_node_id]
         else:
-            self.style_visible = True
+            self.style_visible = False
 
-        self.children: List[DomNode] = []
+        self.children: list[DomNode] = []
         self.parent = parent
         if self.parent is None:
             self.level = 0
@@ -108,10 +112,75 @@ class DomNode:
             self.level = self.parent.level + 1
 
         for child in node.get("children", []):
-            self.children.append(DomNode(child, self, bounds_dict))
+            self.children.append(DomNode(child, self, bounds_dict=bounds_dict, visible_dict=visible_dict))
 
     def __repr__(self):
         return f"<DomNode {self.local_name} backend_node_id={self.backend_node_id}>"
+
+    def _build_selector_candidates(self) -> list[str]:
+        selectors = []
+
+        attrs = self.attributes or {}
+        tag = self.local_name
+
+        base_selector = tag
+        if "id" in attrs:
+            base_selector += f'#{css_escape(attrs["id"])}'
+
+        # data-xxx
+        for key in attrs:
+            if key.startswith("data-"):
+                selectors.append(f'{base_selector}[{key}="{css_escape(attrs[key])}"]')
+        # name
+        if "name" in attrs:
+            selectors.append(f'{base_selector}[name="{css_escape(attrs["name"])}"]')
+        # class
+        if "class" in attrs:
+            classes = attrs["class"].split()
+            selectors.append(base_selector + "".join(f".{css_escape(c)}" for c in classes[:3]))
+        return selectors
+
+    async def find_node_in_page(self, page: Page):
+        if len(self.children) == 1 and self.children[0].node_type == NodeType.TEXT_NODE:
+            target_text = self.children[0].node_value.strip()
+            if target_text:
+                loc = page.get_by_text(target_text, exact=True)
+                if await loc.count() == 1:
+                    return loc
+
+        target = self
+        if self.node_type == NodeType.TEXT_NODE:
+            target = self.parent
+            assert target is not None
+
+        # CSS selector
+        for selector in target._build_selector_candidates():
+            try:
+                loc = page.locator(selector)
+                if await loc.count() == 1:
+                    return loc
+            except:
+                pass
+
+        # 祖先节点构造 css selector
+        ancestors: list["DomNode"] = []
+        node = target
+        while node.parent is not None and node.node_type == NodeType.ELEMENT_NODE and len(ancestors) < 5:
+            ancestors.append(node)
+            node = node.parent
+
+        selector = []
+        for node in reversed(ancestors):
+            cur_selector = node.local_name
+            if "id" in node.attributes:
+                cur_selector += f'#{css_escape(node.attributes["id"])}'
+            selector.append(cur_selector)
+        selector = " > ".join(selector)
+        loc = page.locator(selector)
+        if await loc.count() == 1:
+            return loc
+
+        return None
 
     def get_description(self) -> str:
 
@@ -132,10 +201,8 @@ class DomNode:
         bounds_list: list[tuple[float, float, float, float]] = []
 
         def collect(node: "DomNode"):
-            if not node.style_visible or node.bounds is None:
-                return
-
-            bounds_list.append(node.bounds)
+            if node.style_visible and node.bounds is not None:
+                bounds_list.append(node.bounds)
 
             for child in node.children:
                 collect(child)
@@ -198,7 +265,7 @@ class DomNode:
             node_text += f"[{self.backend_node_id}]<{self.local_name}{attr_str}>"
         else:
             if self.node_type == NodeType.TEXT_NODE:
-                node_text += f"[{self.backend_node_id}]{self.node_value}"
+                node_text += f"{self.node_value}"
             else:
                 node_text += f"[{self.backend_node_id}]<{self.local_name}{attr_str} />"
 
@@ -229,11 +296,11 @@ class DomNode:
 
     def find_nodes_by_backend_node_ids(
         self,
-        target_ids: List[int],
-    ) -> List[Optional["DomNode"]]:
+        target_ids: list[int],
+    ) -> list[Optional["DomNode"]]:
         node_map = {}
 
-        stack: List["DomNode"] = [self]
+        stack: list["DomNode"] = [self]
         target_set = set(target_ids)
 
         while stack and target_set:
@@ -269,15 +336,15 @@ class DomNode:
             return self._ancestor_set
 
 
-def parse_dom(dom_json: Dict[str, Any], dom_snapshot: Dict[str, Any]) -> DomNode:
+def parse_dom(dom_json: dict[str, Any], dom_snapshot: dict[str, Any]) -> DomNode:
     dom_snapshot_strings = dom_snapshot["strings"]
     bounds_dict = {}
     visible_dict = {}
 
     def is_invisible_by_style(display: str, visibility: str, opacity: str) -> bool:
-        if display == "none":
+        if display.strip().lower() == "none":
             return True
-        if visibility == "hidden":
+        if visibility.strip().lower() == "hidden":
             return True
         if float(opacity) <= 0:
             return True
@@ -289,18 +356,20 @@ def parse_dom(dom_json: Dict[str, Any], dom_snapshot: Dict[str, Any]) -> DomNode
         for node_index, bounds, styles in zip(
             doc["layout"]["nodeIndex"], doc["layout"]["bounds"], doc["layout"]["styles"]
         ):
-            bounds_dict[node_index_to_backend_node_ids[node_index]] = bounds
+            backend_node_id = node_index_to_backend_node_ids[node_index]
+            bounds_dict[backend_node_id] = bounds
             string_styles = [dom_snapshot_strings[idx] for idx in styles]
-            if string_styles and is_invisible_by_style(*string_styles):
-                visible_dict[node_index_to_backend_node_ids[node_index]] = False
-            else:
-                visible_dict[node_index_to_backend_node_ids[node_index]] = True
+
+            is_visible = True
+            if len(string_styles) == 3 and is_invisible_by_style(*string_styles):
+                is_visible = False
+            visible_dict[backend_node_id] = is_visible
 
     root = DomNode(dom_json["root"], None, bounds_dict, visible_dict)
     return root
 
 
-def cluster_dom_rects(nodes: List[DomNode], alpha: float = 0.5, distance_threshold: float = 0.5) -> List[List[DomNode]]:
+def cluster_dom_rects(nodes: list[DomNode], alpha: float = 0.5, distance_threshold: float = 0.5) -> list[list[DomNode]]:
     """
     基于节点的空间距离和DOM结构距离进行层次聚类。
     参数:
@@ -359,7 +428,7 @@ def cluster_dom_rects(nodes: List[DomNode], alpha: float = 0.5, distance_thresho
     return list(clusters.values())
 
 
-def get_cluster_covered_bounds(nodes: List[DomNode]) -> tuple[float, float, float, float]:
+def get_cluster_covered_bounds(nodes: list[DomNode]) -> tuple[float, float, float, float]:
     max_bounds = [node.max_bounds() for node in nodes]
     valid_bounds = [b for b in max_bounds if b is not None]
     assert valid_bounds

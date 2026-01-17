@@ -3,6 +3,7 @@ from typing import TypedDict
 from io import BytesIO
 import time
 from openai import AsyncOpenAI as AsyncClient
+from openai.types import CompletionUsage
 from PIL.Image import Image
 
 
@@ -47,12 +48,18 @@ def image_to_base64(image: Image, default_fmt="JPEG") -> dict:
     }
 
 
+class TokenInfo(TypedDict):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
 class PrimaryLLM:
     client: AsyncClient
     text_model: str
     image_model: str
     temperature: float
-    tokenDict: dict
+    tokenDict: dict[str, TokenInfo]
 
     @classmethod
     def init(
@@ -68,6 +75,19 @@ class PrimaryLLM:
         cls.text_model = text_model
         cls.image_model = image_model
         cls.tokenDict = {}
+
+    @classmethod
+    def update_token_dict(cls, model: str, usage: CompletionUsage):
+        if model not in cls.tokenDict:
+            cls.tokenDict[model] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+
+        cls.tokenDict[model]["completion_tokens"] += usage.completion_tokens
+        cls.tokenDict[model]["prompt_tokens"] += usage.prompt_tokens
+        cls.tokenDict[model]["total_tokens"] += usage.total_tokens
 
     @classmethod
     async def chat_with_text_detail(cls, prompt: str, **kwargs) -> ChatTextDetails:
@@ -118,6 +138,7 @@ class PrimaryLLM:
         completion_tokens = usage.completion_tokens
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
+        cls.update_token_dict(cls.text_model, usage)
 
         return {
             "prompt": prompt,
@@ -183,6 +204,7 @@ class PrimaryLLM:
         completion_tokens = usage.completion_tokens
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
+        cls.update_token_dict(cls.text_model, usage)
 
         return {
             "prompt": prompt,
@@ -253,6 +275,7 @@ class PrimaryLLM:
         completion_tokens = usage.completion_tokens
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
+        cls.update_token_dict(cls.text_model, usage)
 
         return {
             "prompt": prompt,

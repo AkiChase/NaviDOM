@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime
 import itertools
+import json
 from pathlib import Path
 import re
 from loguru import logger
@@ -28,7 +29,6 @@ from agent.utils import (
     bg_colors,
     page_screenshot,
 )
-
 
 class Agent:
     context: BrowserContext
@@ -62,9 +62,10 @@ class Agent:
     async def run(self):
         start_time = datetime.now()
         # 简单起见假设只有一个页面
+        # 未实现对iframe的处理(不可见其中的子元素)
+
         page = await self.context.new_page()
         await page.add_init_script("Object.defineProperties(navigator, {webdriver:{get:()=>undefined}});")
-
         cdp_session = await page.context.new_cdp_session(page)
 
         # 初次导航
@@ -113,7 +114,10 @@ class Agent:
                 )
                 break
 
-        logger.info(f"[Time] Total time cost: {format_time_delta(start_time, datetime.now())}")
+        end_time = datetime.now()
+        logger.info(f"[Time] Total time cost: {format_time_delta(start_time, end_time)}")
+        out = self.save_result((end_time - start_time).total_seconds())
+        self.save_report(**out, out_dir=self.out_dir)
 
     async def observation(self, page: Page, before_act_screenshot: Image.Image):
         time_line = TimeLine()
@@ -163,13 +167,15 @@ Important constraints:
                 prompt, [before_act_screenshot, after_act_screenshot]
             )
             logger.debug(f"[Result] {llm_details['content']}")
-            observation = f"### Last Actions Result\n{llm_details['content']}"
+            observation = llm_details["content"]
             time_line.add("llm")
         else:
+            logger.debug(f"[Result] UI page not changed")
             observation = f"UI page not changed"
             llm_details = None
             time_line.add("fetch")
 
+        time_line.add("end")
         record = ObservationRecord(
             index=record_index,
             llm_details=llm_details,
@@ -233,6 +239,7 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
         logger.debug(f"[Nearest Next Objective] {nearest_next_objective}")
         logger.debug(f"[Future Plan] {future_plan}")
 
+        time_line.add("end")
         record = PlanningRecord(
             index=record_index,
             llm_details=llm_details,
@@ -240,6 +247,7 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
             nearest_next_objective=nearest_next_objective,
             future_plan=future_plan,
             task_completed=False,
+            time_line=time_line,
         )
         if Config.debug:
             record.save(self.out_dir)
@@ -289,7 +297,7 @@ They represent intermediate results that will be refined and returned to the use
 [Current State]
 Briefly describe what the page currently represents and what progress (if any) has been made toward the task objective.
 [Nearest Next Objective]
-State the single most immediate sub-goal that should be achieved next in order to move closer to the task objective. This should be concrete and actionable (e.g., “open login form”, “submit search query”, “navigate to checkout page”).
+State the single most immediate sub-goal that should be achieved next in order to move closer to the task objective. This should be concrete and actionable (e.g., “close dialogs”, “open login form”, “submit search query”, “navigate to checkout page”).
 [Future Plan]
 Outline the expected high-level steps that will follow AFTER the nearest next objective is completed. Keep this concise and forward-looking; do not describe low-level actions or UI mechanics.
         """.strip()
@@ -324,6 +332,7 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
             logger.debug(f"[Nearest Next Objective] {nearest_next_objective}")
             logger.debug(f"[Future Plan] {future_plan}")
 
+        time_line.add("end")
         record = PlanningRecord(
             index=record_index,
             llm_details=llm_details,
@@ -331,6 +340,7 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
             nearest_next_objective=nearest_next_objective,
             future_plan=future_plan,
             task_completed=task_completed,
+            time_line=time_line,
         )
         if Config.debug:
             record.save(self.out_dir)
@@ -391,8 +401,8 @@ User Request:
             action_screenshot_path=action_screenshot_path,
             result_screenshot_path=result_screenshot_path,
         )
-        time_line.add(f"execute_{action_index:03}")
 
+        time_line.add(f"execute_{action_index:03}")
         record = ActRecord(
             index=record_index,
             action_details_list=[action_details],
@@ -436,7 +446,7 @@ User Request:
 
         stage_tree_repr = []
         Pruning.trim_dom_tree_by_visibility(tree, viewport)
-        stage_tree_repr.append(("visibility", tree.get_human_tree_repr()))
+        # stage_tree_repr.append(("visibility", tree.get_human_tree_repr()))
         Pruning.filter_dom_tree_by_node(tree)
         # stage_tree_repr.append(("filter", tree.get_human_tree_repr()))
         Pruning.promote_dom_tree_children(tree)
@@ -477,7 +487,7 @@ User Request:
 
         # 基于语义对元素进行剪枝
         # 空间聚类， alpha 高时以像素坐标的距离为主；alpha 低时以DOM结构的距离为主
-        clusters = dom_utils.cluster_dom_rects(interactive_nodes, alpha=0.45, distance_threshold=0.45)
+        clusters = dom_utils.cluster_dom_rects(interactive_nodes, alpha=0.45, distance_threshold=0.4)
         clusters = [
             c
             for c in clusters
@@ -717,3 +727,213 @@ Do NOT include explanations or any additional text.
             record.save(self.out_dir)
         self.records.append(record)
         self.last_act_record = record
+
+    def save_result(self, total_time_cost: float):
+        user_request = self.user_request
+        token = PrimaryLLM.tokenDict
+        for k, v in SecondaryLLM.tokenDict.items():
+            if k not in token:
+                token[k] = v
+            else:
+                token[k]["completion_tokens"] += v["completion_tokens"]
+                token[k]["prompt_tokens"] += v["prompt_tokens"]
+                token[k]["total_tokens"] += v["total_tokens"]
+
+        success = self.last_planning_record is not None and self.last_planning_record.task_completed
+        if success:
+            assert self.last_planning_record is not None
+            result = self.last_planning_record.current_state
+        else:
+            result = "Task failed."
+
+        records = []
+        for record in self.records:
+            if isinstance(record, ActRecord):
+                records.append(
+                    {
+                        "type": "act",
+                        "actions": [
+                            {
+                                "raw": d.raw_action,
+                                "success": d.execute_result["success"],
+                                "additional": (
+                                    d.execute_result["additional"]["content"]
+                                    if isinstance(d.execute_result["additional"], dict)
+                                    else d.execute_result["additional"]
+                                ),
+                            }
+                            for d in record.action_details_list
+                        ],
+                        "time_cost": round(record.time_line.total_time(), 4),
+                    }
+                )
+            elif isinstance(record, ObservationRecord):
+                records.append(
+                    {
+                        "type": "observation",
+                        "observation": record.observation,
+                        "time_cost": round(record.time_line.total_time(), 4),
+                    }
+                )
+            elif isinstance(record, PlanningRecord):
+                if record.task_completed:
+                    records.append(
+                        {
+                            "type": "planning",
+                            "task_completed": record.task_completed,
+                            "task_result": record.current_state,
+                            "time_cost": round(record.time_line.total_time(), 4),
+                        }
+                    )
+                else:
+                    records.append(
+                        {
+                            "type": "planning",
+                            "current_state": record.current_state,
+                            "nearest_next_objective": record.nearest_next_objective,
+                            "future_plan": record.future_plan,
+                            "task_completed": record.task_completed,
+                            "time_cost": round(record.time_line.total_time(), 4),
+                        }
+                    )
+
+        time_cost = {
+            "total_time": round(total_time_cost, 4),
+            "act_time": 0,
+            "observation_time": 0,
+            "planning_time": 0,
+        }
+        for record in self.records:
+            if isinstance(record, ActRecord):
+                time_cost["act_time"] += record.time_line.total_time()
+            elif isinstance(record, ObservationRecord):
+                time_cost["observation_time"] += record.time_line.total_time()
+            elif isinstance(record, PlanningRecord):
+                time_cost["planning_time"] += record.time_line.total_time()
+        time_cost["act_time"] = round(time_cost["act_time"], 4)
+        time_cost["observation_time"] = round(time_cost["observation_time"], 4)
+        time_cost["planning_time"] = round(time_cost["planning_time"], 4)
+
+        out = {
+            "user_request": user_request,
+            "token": token,
+            "records": records,
+            "time_cost": time_cost,
+            "success": success,
+            "result": result,
+        }
+
+        with open(self.out_dir / "result.json", "w") as f:
+            json.dump(
+                out,
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        return out
+
+    @staticmethod
+    def save_report(
+        user_request: str, success: bool, result: str, token: dict, time_cost: dict, records: list, out_dir: Path
+    ):
+        report_lines: list[str] = []
+
+        # Header
+        report_lines.append("# Task Execution Report")
+        report_lines.append("")
+
+        # Part 1: Overall Summary
+        report_lines.append("## 1. Overall Summary")
+        report_lines.append("")
+        # User Request
+        report_lines.append("### User Request")
+        report_lines.append("")
+        report_lines.append(f"> {user_request.strip()}")
+        report_lines.append("")
+        # Success
+        report_lines.append("### Task Result")
+        report_lines.append(f"- **Success**: {'✅ Yes' if success else '❌ No'}")
+        report_lines.append(f"- **Result**: {result}")
+        report_lines.append("")
+        # Token usage
+        report_lines.append("### Token Usage")
+        report_lines.append("")
+        report_lines.append("| Model | Prompt Tokens | Completion Tokens | Total Tokens |")
+        report_lines.append("|------|---------------|-------------------|--------------|")
+        for model_name, t in token.items():
+            report_lines.append(
+                f"| {model_name} | {t.get('prompt_tokens', 0)} | "
+                f"{t.get('completion_tokens', 0)} | {t.get('total_tokens', 0)} |"
+            )
+        report_lines.append("")
+        # Time cost
+        report_lines.append("### Time Cost (seconds)")
+        report_lines.append("")
+        report_lines.append("| Type | Time |")
+        report_lines.append("|------|------|")
+        report_lines.append(f"| Total | {time_cost['total_time']} |")
+        report_lines.append(f"| Act | {time_cost['act_time']} |")
+        report_lines.append(f"| Observation | {time_cost['observation_time']} |")
+        report_lines.append(f"| Planning | {time_cost['planning_time']} |")
+        report_lines.append("")
+
+        # Part 2: Execution Records
+        report_lines.append("## 2. Execution Records")
+        report_lines.append("")
+
+        for idx, record in enumerate(records, start=1):
+            record_type = record["type"]
+            # Act Record
+            if record_type == "act":
+                report_lines.append(f"### {idx}. Act")
+                report_lines.append(f"**Time Cost**: {record['time_cost']}s")
+                report_lines.append("")
+                report_lines.append("**Actions:**")
+                for action_idx, action in enumerate(record["actions"], start=1):
+                    success_flag = "✅" if action["success"] else "❌"
+                    report_lines.append(f"{action_idx}. **Action {action_idx}**")
+                    report_lines.append(f"    - **Raw**: {action['raw']}")
+                    report_lines.append(f"    - **Success**: {success_flag}")
+                    if action.get("additional") is not None:
+                        report_lines.append(f"    - **Additional**: {action['additional']}")
+                report_lines.append("")
+            # Observation Record
+            elif record_type == "observation":
+                report_lines.append(f"### {idx}. Observation")
+                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append("")
+                report_lines.append("**Observation**:")
+                report_lines.append(record["observation"])
+                report_lines.append("")
+            # Planning Record
+            elif record_type == "planning":
+                report_lines.append(f"### {idx}. Planning")
+                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(f"- **Task Completed**: {record['task_completed']}")
+                report_lines.append("")
+
+                if record["task_completed"]:
+                    report_lines.append("**Task Result:**")
+                    report_lines.append(record.get("task_result", ""))
+                else:
+                    report_lines.append("**Current State:**")
+                    report_lines.append(record.get("current_state", ""))
+                report_lines.append("")
+
+                if not record["task_completed"]:
+                    report_lines.append("**Nearest Next Objective:**")
+                    report_lines.append(record.get("nearest_next_objective", ""))
+                    report_lines.append("")
+
+                    report_lines.append("")
+                    report_lines.append("**Future Plan:**")
+                    report_lines.append(record.get("future_plan", ""))
+                    report_lines.append("")
+                report_lines.append("")
+
+        # Write md file
+        report_path = out_dir / "report.md"
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+        logger.info("Report saved to {}", report_path)
