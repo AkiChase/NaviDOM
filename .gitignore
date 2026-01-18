@@ -16,3 +16,4 @@ output
 local
 *.code-workspace
 .DS_Store
+script_evaluate.py

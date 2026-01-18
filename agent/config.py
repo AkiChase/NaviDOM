@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import shutil
 import sys
 from loguru import logger
 
@@ -17,6 +18,9 @@ class Config:
 
     @classmethod
     def init(cls, env_path: str, out_dir: Path):
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+
         logger.remove()
         logger.add(
             sys.stdout,
@@ -37,7 +41,7 @@ class Config:
         cls.browser_viewport_w = viewport.get("width", 1280)
         cls.browser_viewport_h = viewport.get("height", 720)
         cls.max_act_retry_times = env.get("max_act_retry_times", 3)
-        cls.max_iteration_times = env.get("max_iteration_times", 15)
+        cls.max_iteration_times = env.get("max_iteration_times", 10)
 
         primary_llm_service = env["primary_llm_service"]
         secondary_llm_service = env["secondary_llm_service"]

@@ -61,7 +61,7 @@ class Action:
     def get_description(self) -> str:
         out = [self.type.value]
         if self.target:
-            out.append(self.target.get_description())
+            out.append(f"target={self.target.get_description()}")
         for k, v in self.extra.items():
             out.append(f"{k}={v}")
         return ", ".join(out)

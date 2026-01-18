@@ -187,7 +187,11 @@ class DomNode:
         def collect_text(node: "DomNode") -> list[str]:
             out: list[str] = []
             if node.node_type == NodeType.TEXT_NODE:
-                out.append(node.node_value)
+                if node.node_value.strip():
+                    if len(node.node_value) < 20:
+                        out.append(node.node_value)
+                    else:
+                        out.append(f"{node.node_value[:20]}...")
 
             for child in node.children:
                 out.extend(collect_text(child))

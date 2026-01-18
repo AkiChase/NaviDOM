@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 from loguru import logger
 from playwright.async_api import BrowserContext, Page, CDPSession
-from PIL import ImageFont, ImageDraw, Image
+from PIL import ImageFont, ImageDraw, Image, ImageChops
 
 from agent import dom_utils
 from agent.action import (
@@ -29,6 +29,7 @@ from agent.utils import (
     bg_colors,
     page_screenshot,
 )
+
 
 class Agent:
     context: BrowserContext
@@ -59,17 +60,22 @@ class Agent:
             return "No entries."
         return "\n".join([f"- {label}: {value}" for label, value in self.memory])
 
-    async def run(self):
-        start_time = datetime.now()
-        # 简单起见假设只有一个页面
-        # 未实现对iframe的处理(不可见其中的子元素)
+    async def run(self, start_url: str | None = None):
+        # 简单起见假设只有一个页面, 且未实现对iframe的处理(不可见其中的子元素)
+        # TODO 如果弹出了新页面则切换page到新页面
 
+        start_time = datetime.now()
         page = await self.context.new_page()
         await page.add_init_script("Object.defineProperties(navigator, {webdriver:{get:()=>undefined}});")
         cdp_session = await page.context.new_cdp_session(page)
 
-        # 初次导航
-        await self.act_initial(page, cdp_session)
+        if start_url:
+            logger.info(f"[Run] Start with URL: {start_url}")
+            await page.goto(start_url)
+        else:
+            # 初次导航
+            await self.act_initial(page, cdp_session)
+
         # 初次规划
         await self.planning_initial(page)
 
@@ -132,17 +138,21 @@ class Agent:
             d for d in success_action_details_list if d.action.type not in {ActionType.Extract, ActionType.Memory}
         ]
 
-        if success_ui_change_action_list:
+        after_act_screenshot = await page_screenshot(page)
+        ui_changed = ImageChops.difference(before_act_screenshot, after_act_screenshot).getbbox() is not None
+        if ui_changed:
             logger.info(f"[{record_index:03}] Observation")
-            after_act_screenshot = await page_screenshot(page)
+            if success_ui_change_action_list:
+                actions_info = "\n".join(
+                    [f"{index}. {d.action.get_description()}" for index, d in enumerate(success_ui_change_action_list)]
+                )
+            else:
+                actions_info = "No actions."
+
             if Config.debug:
                 record_prefix = f"{record_index:03}_observation"
                 before_act_screenshot.save(self.out_dir / f"{record_prefix}_debug_before.jpg")
                 after_act_screenshot.save(self.out_dir / f"{record_prefix}_debug_after.jpg")
-
-            actions_info = "\n".join(
-                [f"{index}. {d.action.get_description()}" for index, d in enumerate(success_ui_change_action_list)]
-            )
 
             time_line.add("fetch")
             prompt = f"""
@@ -261,6 +271,15 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
 
         assert self.last_planning_record is not None
         assert self.last_observation_record is not None
+        assert self.last_act_record is not None
+
+        actions_info = "\n".join(
+            [
+                f"{index}. {d.action.get_description()}"
+                for index, d in enumerate(self.last_act_record.action_details_list)
+                if d.execute_result["success"]
+            ]
+        )
 
         time_line.add("fetch")
 
@@ -277,8 +296,14 @@ Last Task State: {self.last_planning_record.current_state}
 Last Nearest Next Objective: {self.last_planning_record.nearest_next_objective}
 Last Future Plan: {self.last_planning_record.future_plan}
 
+## Last Action Details
+The following information describes the actions executed in the previous step:
+{actions_info}
+
 ## Observation Details
-{self.last_observation_record.observation}
+This section contains Observation of the UI after the execution of actions in Last Action Details.
+If the UI did not change as expected, it may indicate that the previously planning was incorrect, and an alternative approach should be planned to achieve the task objective.
+Observation: {self.last_observation_record.observation}
 
 ## Memory Entries
 The following items were stored related to the user request in previous iterations.
@@ -647,7 +672,7 @@ Do NOT include explanations or any additional text.
         llm_action_res = llm_action_detail["content"]
 
         action_details_list = []
-        raw_action_list = llm_action_res.strip().split("\n")
+        raw_action_list = [line for line in llm_action_res.strip().split("\n") if line.strip()]
         raw_action_types = [raw_action.split(",", maxsplit=1)[0].strip() for raw_action in raw_action_list]
         logger.debug(f"[Action] Construct {len(raw_action_list)} actions: [{', '.join(raw_action_types)}]")
         for action_index, raw_action in enumerate(raw_action_list, 1):
@@ -680,7 +705,7 @@ Do NOT include explanations or any additional text.
                     "additional": await action.execute(page, cdp_session, self.memory),
                 }
             except ActionParseException as e:
-                logger.warning(f"[Act] Parse {action.type.value} action failed: {e}")
+                logger.warning(f"[Act] Parse action failed, {e}. Action: {raw_action}")
                 draw_text_label(action_screenshot_draw, text=action.type.name, position=(10, 10), font=self.font_18)
                 draw_text_label(action_screenshot_draw, text=str(e), position=(10, 40), font=self.font_18)
                 action_screenshot_path = self.out_dir / f"{action_prefix}_error.jpg"
@@ -755,7 +780,10 @@ Do NOT include explanations or any additional text.
                         "actions": [
                             {
                                 "raw": d.raw_action,
+                                "description": d.action.get_description(),
                                 "success": d.execute_result["success"],
+                                "action_screenshot_name": d.action_screenshot_path.name,
+                                "result_screenshot_name": d.result_screenshot_path.name,
                                 "additional": (
                                     d.execute_result["additional"]["content"]
                                     if isinstance(d.execute_result["additional"], dict)
@@ -894,9 +922,21 @@ Do NOT include explanations or any additional text.
                     success_flag = "✅" if action["success"] else "❌"
                     report_lines.append(f"{action_idx}. **Action {action_idx}**")
                     report_lines.append(f"    - **Raw**: {action['raw']}")
+                    report_lines.append(f"    - **Description**: {action['description']}")
                     report_lines.append(f"    - **Success**: {success_flag}")
                     if action.get("additional") is not None:
                         report_lines.append(f"    - **Additional**: {action['additional']}")
+
+                    # 并排显示截图
+                    action_img = f"![Action]({action['action_screenshot_name']})"
+                    result_img = f"![Result]({action['result_screenshot_name']})" if action["success"] else ""
+                    if action["success"]:
+                        # 使用 HTML 表格并排
+                        img_html = f"<table><tr><td>{action_img}</td><td>{result_img}</td></tr></table>"
+                        report_lines.append(f"    - **Screenshots**: {img_html}")
+                    else:
+                        report_lines.append(f"    - **Action Screenshot**: {action_img}")
+
                 report_lines.append("")
             # Observation Record
             elif record_type == "observation":
