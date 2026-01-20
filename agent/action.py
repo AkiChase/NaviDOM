@@ -12,7 +12,7 @@ from playwright.async_api import Page, CDPSession
 
 from agent.llm import ChatImageDetails, SecondaryLLM
 from agent.pruning import Pruning
-from agent.utils import SpecialException, google_search_url, page_screenshot, time_stamp
+from agent.utils import SpecialException, google_search_url, tab_screenshot, time_stamp
 
 
 class ActionParseException(SpecialException):
@@ -32,18 +32,34 @@ class ActionType(Enum):
     Extract = "EXTRACT"
     Navigate = "NAVIGATE"
     Search = "SEARCH"
+    TabSwitch = "TAB_SWITCH"
+    TabClose = "TAB_CLOSE"
 
 
 action_format_prompt = {
     ActionType.Click: "CLICK, <backend_node_id>",
     ActionType.Input: "INPUT, <backend_node_id>, <clear:true|false>, <text>\t// In <text>, only \\n has special meaning for line breaks; no other escaping is required",
-    ActionType.Scroll: "SCROLL, <up|down>\t// Move exactly one page (down +1, up -1)",
+    ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>",
     ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.Memory: "MEMORY, <label>, <content>\t// If the user request requires certain information to be output, store <content> under a semantic <label> using this action. After task completion, all stored MEMORY contents will be refined and returned to the user",
-    ActionType.Extract: "EXTRACT, <label>, <instruction>\t// Extract information from current UI page according to <instruction>, and store the result in MEMORY under <label>. When extracting multiple items, do NOT split them into multiple EXTRACT actions; combine them into a single EXTRACT action whenever possible",
+    ActionType.Extract: "EXTRACT, <label>, <instruction>\t// Use a sub-agent to extract information from the full text and screenshot of current tab page, following <instruction>, and store the result in MEMORY under <label>.",
     ActionType.Navigate: "NAVIGATE, <url>\t// Navigate to the specified URL",
     ActionType.Search: "SEARCH, <keywords>\t// Navigate to Google search results for the given keywords",
+    ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to and activate the specified tab",
+    ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
 }
+all_action_types = [
+    ActionType.Click,
+    ActionType.Input,
+    ActionType.Scroll,
+    ActionType.Press,
+    ActionType.Memory,
+    ActionType.Extract,
+    ActionType.Navigate,
+    ActionType.Search,
+    ActionType.TabSwitch,
+    ActionType.TabClose,
+]
 
 
 class Action:
@@ -69,21 +85,12 @@ class Action:
     @staticmethod
     def get_format_prompt(types: list[ActionType] | None = None):
         if types is None:
-            types = [
-                ActionType.Click,
-                ActionType.Input,
-                ActionType.Scroll,
-                ActionType.Press,
-                ActionType.Memory,
-                ActionType.Extract,
-                ActionType.Navigate,
-                ActionType.Search,
-            ]
+            types = all_action_types
 
-        return "\n".join([action_format_prompt[t] for t in types])
+        return "\n".join([f"- {action_format_prompt[t]}" for t in types])
 
     @staticmethod
-    def from_raw_action(uid: str, raw_action: str, dom_nodes: list[DomNode]) -> "Action":
+    def from_raw_action(uid: str, raw_action: str, dom_nodes: list[DomNode], tab_dict: dict[int, Page]) -> "Action":
         raw_action = raw_action.strip()
         assert raw_action, "Empty action line"
 
@@ -100,16 +107,16 @@ class Action:
 
         if action_type == ActionType.Click:
             # CLICK, <backend_node_id>
-            assert len(parts) == 2, f"Invalid CLICK format: {raw_action}"
+            assert len(parts) == 2, ActionParseException(f"Invalid CLICK format: {raw_action}")
             target = find_target(parts[1])
             return Action(uid, action_type, target, {})
         elif action_type == ActionType.Input:
             # INPUT, <backend_node_id>, <clear>, <text>
-            assert len(parts) == 2, f"Invalid INPUT format: {raw_action}"
+            assert len(parts) == 2, ActionParseException(f"Invalid INPUT format: {raw_action}")
             sub_parts = [p.strip() for p in parts[1].split(",", maxsplit=2)]
-            assert len(sub_parts) == 3, f"Invalid INPUT format: {raw_action}"
+            assert len(sub_parts) == 3, ActionParseException(f"Invalid INPUT format: {raw_action}")
             clear_raw = sub_parts[1].lower()
-            assert clear_raw in ("true", "false"), f"Invalid clear value: {clear_raw}"
+            assert clear_raw in ("true", "false"), ActionParseException(f"Invalid clear value: {clear_raw}")
             clear = clear_raw == "true"
             text = sub_parts[2].replace("\\n", "\n")
             target = find_target(sub_parts[0])
@@ -123,55 +130,77 @@ class Action:
                 },
             )
         elif action_type == ActionType.Scroll:
-            # SCROLL, <up|down>
-            assert len(parts) == 2, f"Invalid SCROLL format: {raw_action}"
-            direction = parts[1].lower()
-            assert direction in ("up", "down"), f"Invalid scroll direction: {direction}"
-            return Action(uid, action_type, None, {"direction": direction})
+            # SCROLL, <direction>, <pages>
+            assert len(parts) == 2, ActionParseException(f"Invalid SCROLL format: {raw_action}")
+            sub_parts = [p.strip() for p in parts[1].split(",", maxsplit=1)]
+            assert len(sub_parts) == 2, ActionParseException(f"Invalid SCROLL format: {raw_action}")
+            direction = sub_parts[0].lower()
+            assert direction in ("up", "down"), ActionParseException(f"Invalid scroll direction: {direction}")
+            pages = float(sub_parts[1])
+            return Action(uid, action_type, None, {"direction": direction, "pages": pages})
         elif action_type == ActionType.Press:
             # PRESS, <KeyboardEvent.key>
-            assert len(parts) == 2, f"Invalid PRESS format: {raw_action}"
+            assert len(parts) == 2, ActionParseException(f"Invalid PRESS format: {raw_action}")
             key = parts[1]
             return Action(uid, action_type, None, {"key": key})
         elif action_type == ActionType.Memory:
             # MEMORY, <label>, <content>
-            assert len(parts) == 2, f"Invalid MEMORY format: {raw_action}"
+            assert len(parts) == 2, ActionParseException(f"Invalid MEMORY format: {raw_action}")
             sub_parts = [p.strip() for p in parts[1].split(",", maxsplit=1)]
-            assert len(sub_parts) == 2, f"Invalid MEMORY format: {raw_action}"
+            assert len(sub_parts) == 2, ActionParseException(f"Invalid MEMORY format: {raw_action}")
             label = sub_parts[0]
             content = sub_parts[1]
             return Action(uid, action_type, None, {"label": label, "content": content})
         elif action_type == ActionType.Extract:
             # EXTRACT, <label>, <instruction>
-            assert len(parts) == 2, f"Invalid EXTRACT format: {raw_action}"
+            assert len(parts) == 2, ActionParseException(f"Invalid EXTRACT format: {raw_action}")
             sub_parts = [p.strip() for p in parts[1].split(",", maxsplit=1)]
-            assert len(sub_parts) == 2, f"Invalid EXTRACT format: {raw_action}"
+            assert len(sub_parts) == 2, ActionParseException(f"Invalid EXTRACT format: {raw_action}")
             label = sub_parts[0]
             instruction = sub_parts[1]
             return Action(uid, action_type, None, {"label": label, "instruction": instruction})
         elif action_type == ActionType.Navigate:
             # NAVIGATE, <url>
-            assert len(parts) == 2, f"Invalid NAVIGATE format: {raw_action}"
+            assert len(parts) == 2, ActionParseException(f"Invalid NAVIGATE format: {raw_action}")
             url = parts[1]
             return Action(uid, action_type, None, {"url": url})
         elif action_type == ActionType.Search:
             # SEARCH, <keywords>
-            assert len(parts) == 2, f"Invalid SEARCH format: {raw_action}"
+            assert len(parts) == 2, ActionParseException(f"Invalid SEARCH format: {raw_action}")
             keywords = parts[1]
             return Action(uid, action_type, None, {"keywords": keywords})
+        elif action_type == ActionType.TabSwitch:
+            # TAB_SWITCH, <tab_id>
+            assert len(parts) == 2, ActionParseException(f"Invalid TAB_SWITCH format: {raw_action}")
+            tab_id = int(parts[1])
+            if tab_id not in tab_dict:
+                raise ActionParseException(f"Tab ID {tab_id} not found")
+            return Action(uid, action_type, None, {"tab_id": tab_id})
+        elif action_type == ActionType.TabClose:
+            # TAB_CLOSE, <tab_id>
+            assert len(parts) == 2, ActionParseException(f"Invalid TAB_CLOSE format: {raw_action}")
+            tab_id = int(parts[1])
+            if tab_id not in tab_dict:
+                raise ActionParseException(f"Tab ID {tab_id} not found")
+            return Action(uid, action_type, None, {"tab_id": tab_id})
         else:
             raise ActionParseException(f"Unsupported action type: {action_type}")
 
-    async def execute(self, page: Page, cdp_session: CDPSession, memory: list[tuple[str, str]]):
+    async def execute(
+        self, tab: Page, cdp_session: CDPSession, memory: list[tuple[str, str]], tab_dict: dict[int, Page]
+    ):
         # 简单实现
         node = None
         if self.type in [ActionType.Click, ActionType.Input]:
             assert self.target is not None
 
             if self.type == ActionType.Click:
-                loc = await self.target.find_node_in_page(page)
+                loc = await self.target.find_node_in_tab(tab)
                 if loc is not None:
-                    await loc.click(timeout=100)
+                    try:
+                        await loc.click(timeout=300)
+                    except Exception as e:
+                        raise ActionExecuteException(f"Failed to click: {e}")
                 else:
                     node = await cdp_session.send("DOM.resolveNode", {"backendNodeId": self.target.backend_node_id})
                     if "object" not in node or "objectId" not in node["object"]:
@@ -181,19 +210,25 @@ class Action:
                         "Runtime.callFunctionOn",
                         {
                             "objectId": object_id,
-                            "functionDeclaration": "function() {this.click();}",
+                            "functionDeclaration": """function() {
+                                this.click();
+                            }
+                            """,
                         },
                     )
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
             elif self.type == ActionType.Input:
                 clear = self.extra["clear"]
                 text = self.extra["text"]
-                loc = await self.target.find_node_in_page(page)
+                loc = await self.target.find_node_in_tab(tab)
                 if loc is not None:
-                    if clear:
-                        await loc.fill(text, timeout=100)
-                    else:
-                        await loc.type(text, timeout=100)
+                    try:
+                        if clear:
+                            await loc.fill(text, timeout=300)
+                        else:
+                            await loc.type(text, timeout=300)
+                    except Exception as e:
+                        raise ActionExecuteException(f"Failed to click: {e}")
                 else:
                     node = await cdp_session.send("DOM.resolveNode", {"backendNodeId": self.target.backend_node_id})
                     if "object" not in node or "objectId" not in node["object"]:
@@ -219,17 +254,18 @@ class Action:
                             ),
                         },
                     )
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
         elif self.type == ActionType.Scroll:
-            dy = Config.browser_viewport_h
+            pages = self.extra["pages"]
+            dy = Config.browser_viewport_h * pages
             direction = self.extra["direction"]
             if direction == "up":
                 dy = -dy
-            await page.evaluate(f"window.scrollBy(0, {dy});")
+            await tab.evaluate(f"window.scrollBy(0, {dy});")
             await asyncio.sleep(1)
         elif self.type == ActionType.Press:
             key = self.extra["key"]
-            await page.keyboard.press(key)
+            await tab.keyboard.press(key)
             await asyncio.sleep(1)
         elif self.type == ActionType.Memory:
             label = self.extra["label"]
@@ -266,18 +302,30 @@ Your task is to extract only the information that is explicitly requested in the
 - If the requested information is not present, output `NOT_FOUND`.
 - Output only the extracted information. Do not include additional explanations.
             """.strip()
-            screenshot = await page_screenshot(page)
+            screenshot = await tab_screenshot(tab)
             llm_details = await SecondaryLLM.chat_with_image_detail(prompt, screenshot)
             memory.append((self.extra["label"], llm_details["content"]))
             return llm_details
         elif self.type == ActionType.Navigate:
             url = self.extra["url"]
-            await page.goto(url)
+            await tab.goto(url)
             await asyncio.sleep(1)
         elif self.type == ActionType.Search:
             keywords = self.extra["keywords"]
-            await page.goto(google_search_url(keywords))
+            await tab.goto(google_search_url(keywords))
             await asyncio.sleep(1)
+        elif self.type == ActionType.TabSwitch:
+            tab_id = self.extra["tab_id"]
+            if tab_id not in tab_dict:
+                raise ActionExecuteException(f"Tab ID {tab_id} not found")
+            tab = tab_dict[tab_id]
+            await tab.bring_to_front()
+        elif self.type == ActionType.TabClose:
+            tab_id = self.extra["tab_id"]
+            if tab_id not in tab_dict:
+                raise ActionExecuteException(f"Tab ID {tab_id} not found")
+            tab = tab_dict[tab_id]
+            await tab.close()
         else:
             raise NotImplementedError(f"Action type {self.type} is not implemented")
 
@@ -291,7 +339,6 @@ class ActionExecuteResult(TypedDict):
 class ActionDetails:
     action: Action
     raw_action: str
-    execute_time: datetime
     execute_result: ActionExecuteResult
     action_screenshot_path: Path
     result_screenshot_path: Path
@@ -299,7 +346,6 @@ class ActionDetails:
     def to_dict(self) -> dict:
         return {
             "raw_action": self.raw_action,
-            "execute_time": time_stamp(self.execute_time),
             "execute_result": self.execute_result,
             "action_screenshot_path": str(self.action_screenshot_path),
             "result_screenshot_path": str(self.result_screenshot_path),

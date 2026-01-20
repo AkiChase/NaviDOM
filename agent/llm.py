@@ -59,7 +59,7 @@ class PrimaryLLM:
     text_model: str
     image_model: str
     temperature: float
-    tokenDict: dict[str, TokenInfo]
+    token_dict: dict[str, TokenInfo]
 
     @classmethod
     def init(
@@ -74,20 +74,20 @@ class PrimaryLLM:
         cls.client = AsyncClient(api_key=api_key, base_url=base_url)
         cls.text_model = text_model
         cls.image_model = image_model
-        cls.tokenDict = {}
+        cls.token_dict = {}
 
     @classmethod
     def update_token_dict(cls, model: str, usage: CompletionUsage):
-        if model not in cls.tokenDict:
-            cls.tokenDict[model] = {
+        if model not in cls.token_dict:
+            cls.token_dict[model] = {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
             }
 
-        cls.tokenDict[model]["completion_tokens"] += usage.completion_tokens
-        cls.tokenDict[model]["prompt_tokens"] += usage.prompt_tokens
-        cls.tokenDict[model]["total_tokens"] += usage.total_tokens
+        cls.token_dict[model]["completion_tokens"] += usage.completion_tokens
+        cls.token_dict[model]["prompt_tokens"] += usage.prompt_tokens
+        cls.token_dict[model]["total_tokens"] += usage.total_tokens
 
     @classmethod
     async def chat_with_text_detail(cls, prompt: str, **kwargs) -> ChatTextDetails:
@@ -204,7 +204,7 @@ class PrimaryLLM:
         completion_tokens = usage.completion_tokens
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
-        cls.update_token_dict(cls.text_model, usage)
+        cls.update_token_dict(cls.image_model, usage)
 
         return {
             "prompt": prompt,
@@ -275,7 +275,7 @@ class PrimaryLLM:
         completion_tokens = usage.completion_tokens
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
-        cls.update_token_dict(cls.text_model, usage)
+        cls.update_token_dict(cls.image_model, usage)
 
         return {
             "prompt": prompt,

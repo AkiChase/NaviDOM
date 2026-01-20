@@ -2,7 +2,6 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
-from typing import Literal
 
 from agent.action import ActionDetails
 from agent.llm import ChatImageDetails, ChatImageListDetails, ChatTextDetails
@@ -33,6 +32,7 @@ class TimeLine:
 @dataclass
 class PlanningRecord(Record):
     llm_details: ChatTextDetails | ChatImageDetails
+    new_progress: str | None
     current_state: str
     nearest_next_objective: str
     future_plan: str

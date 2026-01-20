@@ -37,27 +37,38 @@ class Viewport:
     client_h: float
     total_height: float
     total_width: float
-    page_count_y: int
-    page_index_y: int
-    page_count_x: int
-    page_index_x: int
 
     def __init__(self, viewport: dict[str, Any]):
-        self.page_x = viewport["cssLayoutViewport"]["pageX"]
-        self.page_y = viewport["cssLayoutViewport"]["pageY"]
-        self.client_w = viewport["cssLayoutViewport"]["clientWidth"]
-        self.client_h = viewport["cssLayoutViewport"]["clientHeight"]
-        self.total_height = viewport["cssContentSize"]["height"]
-        self.total_width = viewport["cssContentSize"]["width"]
+        layout = viewport["cssLayoutViewport"]
+        content = viewport["cssContentSize"]
 
-        self.page_count_y = math.ceil(self.total_height / self.client_h)
-        self.page_index_y = math.floor(self.page_y / self.client_w) + 1
-        self.page_count_x = math.ceil(self.total_width / self.client_w)
-        self.page_index_x = math.floor(self.page_y / self.client_h) + 1
+        self.page_x = float(layout["pageX"])
+        self.page_y = float(layout["pageY"])
+        self.client_w = float(layout["clientWidth"])
+        self.client_h = float(layout["clientHeight"])
 
-    def get_page_info(self) -> str:
-        y = f"Y Page: {self.page_index_y}/{self.page_count_y}" if self.page_count_y > 1 else ""
-        return f"{y}".strip()
+        self.total_height = float(content["height"])
+        self.total_width = float(content["width"])
+
+    @property
+    def remaining_up_pages(self) -> float:
+        return max(self.page_y / self.client_h, 0.0)
+
+    @property
+    def remaining_down_pages(self) -> float:
+        remaining_height = self.total_height - (self.page_y + self.client_h)
+        return max(remaining_height / self.client_h, 0.0)
+
+    def get_tab_page_info(self) -> str:
+        up = self.remaining_up_pages
+        down = self.remaining_down_pages
+        parts: list[str] = []
+        if up > 0:
+            parts.append(f"Scrollable up: {up:.2f} pages")
+        if down > 0:
+            parts.append(f"Scrollable down: {down:.2f} pages")
+
+        return ", ".join(parts)
 
 
 class DomNode:
@@ -140,11 +151,11 @@ class DomNode:
             selectors.append(base_selector + "".join(f".{css_escape(c)}" for c in classes[:3]))
         return selectors
 
-    async def find_node_in_page(self, page: Page):
+    async def find_node_in_tab(self, tab: Page):
         if len(self.children) == 1 and self.children[0].node_type == NodeType.TEXT_NODE:
             target_text = self.children[0].node_value.strip()
             if target_text:
-                loc = page.get_by_text(target_text, exact=True)
+                loc = tab.get_by_text(target_text, exact=True)
                 if await loc.count() == 1:
                     return loc
 
@@ -156,7 +167,7 @@ class DomNode:
         # CSS selector
         for selector in target._build_selector_candidates():
             try:
-                loc = page.locator(selector)
+                loc = tab.locator(selector)
                 if await loc.count() == 1:
                     return loc
             except:
@@ -176,7 +187,7 @@ class DomNode:
                 cur_selector += f'#{css_escape(node.attributes["id"])}'
             selector.append(cur_selector)
         selector = " > ".join(selector)
-        loc = page.locator(selector)
+        loc = tab.locator(selector)
         if await loc.count() == 1:
             return loc
 
