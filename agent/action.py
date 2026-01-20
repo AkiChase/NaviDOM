@@ -1,18 +1,19 @@
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import TypedDict
+import typing
 
-from agent import dom_utils
 from agent.config import Config
 from agent.dom_utils import DomNode
 from playwright.async_api import Page, CDPSession
 
-from agent.llm import ChatImageDetails, SecondaryLLM
-from agent.pruning import Pruning
-from agent.utils import SpecialException, google_search_url, tab_screenshot, time_stamp
+from agent.llm import ChatImageDetails
+from agent.utils import SpecialException, bing_search_url
+
+if typing.TYPE_CHECKING:
+    from agent.agent import TabManager
 
 
 class ActionParseException(SpecialException):
@@ -28,8 +29,6 @@ class ActionType(Enum):
     Input = "INPUT"
     Scroll = "SCROLL"
     Press = "PRESS"
-    Memory = "MEMORY"
-    Extract = "EXTRACT"
     Navigate = "NAVIGATE"
     Search = "SEARCH"
     TabSwitch = "TAB_SWITCH"
@@ -41,10 +40,8 @@ action_format_prompt = {
     ActionType.Input: "INPUT, <backend_node_id>, <clear:true|false>, <text>\t// In <text>, only \\n has special meaning for line breaks; no other escaping is required",
     ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>",
     ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
-    ActionType.Memory: "MEMORY, <label>, <content>\t// If the user request requires certain information to be output, store <content> under a semantic <label> using this action. After task completion, all stored MEMORY contents will be refined and returned to the user",
-    ActionType.Extract: "EXTRACT, <label>, <instruction>\t// Use a sub-agent to extract information from the full text and screenshot of current tab page, following <instruction>, and store the result in MEMORY under <label>.",
     ActionType.Navigate: "NAVIGATE, <url>\t// Navigate to the specified URL",
-    ActionType.Search: "SEARCH, <keywords>\t// Navigate to Google search results for the given keywords",
+    ActionType.Search: "SEARCH, <keywords>\t// Navigate to Bing search results for the given keywords",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to and activate the specified tab",
     ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
 }
@@ -53,8 +50,6 @@ all_action_types = [
     ActionType.Input,
     ActionType.Scroll,
     ActionType.Press,
-    ActionType.Memory,
-    ActionType.Extract,
     ActionType.Navigate,
     ActionType.Search,
     ActionType.TabSwitch,
@@ -83,14 +78,16 @@ class Action:
         return ", ".join(out)
 
     @staticmethod
-    def get_format_prompt(types: list[ActionType] | None = None):
-        if types is None:
-            types = all_action_types
+    def get_format_prompt(include_types: list[ActionType] | None = None, exclude_types: list[ActionType] | None = None):
+        if include_types is None:
+            include_types = all_action_types
+        if exclude_types is None:
+            exclude_types = []
 
-        return "\n".join([f"- {action_format_prompt[t]}" for t in types])
+        return "\n".join([f"- {action_format_prompt[t]}" for t in include_types if t not in exclude_types])
 
     @staticmethod
-    def from_raw_action(uid: str, raw_action: str, dom_nodes: list[DomNode], tab_dict: dict[int, Page]) -> "Action":
+    def from_raw_action(uid: str, raw_action: str, dom_nodes: list[DomNode], tab_manager: "TabManager") -> "Action":
         raw_action = raw_action.strip()
         assert raw_action, "Empty action line"
 
@@ -143,22 +140,6 @@ class Action:
             assert len(parts) == 2, ActionParseException(f"Invalid PRESS format: {raw_action}")
             key = parts[1]
             return Action(uid, action_type, None, {"key": key})
-        elif action_type == ActionType.Memory:
-            # MEMORY, <label>, <content>
-            assert len(parts) == 2, ActionParseException(f"Invalid MEMORY format: {raw_action}")
-            sub_parts = [p.strip() for p in parts[1].split(",", maxsplit=1)]
-            assert len(sub_parts) == 2, ActionParseException(f"Invalid MEMORY format: {raw_action}")
-            label = sub_parts[0]
-            content = sub_parts[1]
-            return Action(uid, action_type, None, {"label": label, "content": content})
-        elif action_type == ActionType.Extract:
-            # EXTRACT, <label>, <instruction>
-            assert len(parts) == 2, ActionParseException(f"Invalid EXTRACT format: {raw_action}")
-            sub_parts = [p.strip() for p in parts[1].split(",", maxsplit=1)]
-            assert len(sub_parts) == 2, ActionParseException(f"Invalid EXTRACT format: {raw_action}")
-            label = sub_parts[0]
-            instruction = sub_parts[1]
-            return Action(uid, action_type, None, {"label": label, "instruction": instruction})
         elif action_type == ActionType.Navigate:
             # NAVIGATE, <url>
             assert len(parts) == 2, ActionParseException(f"Invalid NAVIGATE format: {raw_action}")
@@ -173,22 +154,20 @@ class Action:
             # TAB_SWITCH, <tab_id>
             assert len(parts) == 2, ActionParseException(f"Invalid TAB_SWITCH format: {raw_action}")
             tab_id = int(parts[1])
-            if tab_id not in tab_dict:
+            if tab_id not in tab_manager.tab_dict:
                 raise ActionParseException(f"Tab ID {tab_id} not found")
             return Action(uid, action_type, None, {"tab_id": tab_id})
         elif action_type == ActionType.TabClose:
             # TAB_CLOSE, <tab_id>
             assert len(parts) == 2, ActionParseException(f"Invalid TAB_CLOSE format: {raw_action}")
             tab_id = int(parts[1])
-            if tab_id not in tab_dict:
+            if tab_id not in tab_manager.tab_dict:
                 raise ActionParseException(f"Tab ID {tab_id} not found")
             return Action(uid, action_type, None, {"tab_id": tab_id})
         else:
             raise ActionParseException(f"Unsupported action type: {action_type}")
 
-    async def execute(
-        self, tab: Page, cdp_session: CDPSession, memory: list[tuple[str, str]], tab_dict: dict[int, Page]
-    ):
+    async def execute(self, tab: Page, cdp_session: CDPSession, tab_manager: "TabManager"):
         # 简单实现
         node = None
         if self.type in [ActionType.Click, ActionType.Input]:
@@ -218,6 +197,9 @@ class Action:
                     )
                 await asyncio.sleep(1.5)
             elif self.type == ActionType.Input:
+                if not self.target.editable:
+                    raise ActionExecuteException(f"Target {self.target} is not editable")
+                
                 clear = self.extra["clear"]
                 text = self.extra["text"]
                 loc = await self.target.find_node_in_tab(tab)
@@ -267,65 +249,29 @@ class Action:
             key = self.extra["key"]
             await tab.keyboard.press(key)
             await asyncio.sleep(1)
-        elif self.type == ActionType.Memory:
-            label = self.extra["label"]
-            content = self.extra["content"]
-            memory.append((label, content))
-        elif self.type == ActionType.Extract:
-            instruction = self.extra["instruction"]
-            dom = await cdp_session.send("DOM.getDocument", {"depth": -1})
-            snapshot = await cdp_session.send(
-                "DOMSnapshot.captureSnapshot",
-                {
-                    "computedStyles": ["display", "visibility", "opacity"],
-                    "includeDOMRects": True,
-                },
-            )
-            viewport = dom_utils.Viewport(await cdp_session.send("Page.getLayoutMetrics"))
-            tree = dom_utils.parse_dom(dom, snapshot)
-            Pruning.trim_dom_tree_by_visibility(tree, viewport)
-            tree_text = Pruning.extract_dom_tree_text(tree)
-
-            prompt = f"""
-You are an AI assistant specialized in UI understanding and information extraction.
-Your task is to extract only the information that is explicitly requested in the instruction from the UI page.
-
-## Instruction
-{instruction}
-
-## UI Text
-{tree_text}
-
-## Requirements
-- Use the UI text and the screenshot as information sources.
-- Do NOT infer or assume information that is not directly observable.
-- If the requested information is not present, output `NOT_FOUND`.
-- Output only the extracted information. Do not include additional explanations.
-            """.strip()
-            screenshot = await tab_screenshot(tab)
-            llm_details = await SecondaryLLM.chat_with_image_detail(prompt, screenshot)
-            memory.append((self.extra["label"], llm_details["content"]))
-            return llm_details
         elif self.type == ActionType.Navigate:
             url = self.extra["url"]
             await tab.goto(url)
             await asyncio.sleep(1)
         elif self.type == ActionType.Search:
             keywords = self.extra["keywords"]
-            await tab.goto(google_search_url(keywords))
+            await tab.goto(bing_search_url(keywords))
             await asyncio.sleep(1)
         elif self.type == ActionType.TabSwitch:
             tab_id = self.extra["tab_id"]
-            if tab_id not in tab_dict:
+            if tab_id not in tab_manager.tab_dict:
                 raise ActionExecuteException(f"Tab ID {tab_id} not found")
-            tab = tab_dict[tab_id]
+            tab = tab_manager.tab_dict[tab_id]
+            tab_manager.latest_tab_id = tab_id
             await tab.bring_to_front()
+            await asyncio.sleep(0.5)
         elif self.type == ActionType.TabClose:
             tab_id = self.extra["tab_id"]
-            if tab_id not in tab_dict:
+            if tab_id not in tab_manager.tab_dict:
                 raise ActionExecuteException(f"Tab ID {tab_id} not found")
-            tab = tab_dict[tab_id]
+            tab = tab_manager.tab_dict[tab_id]
             await tab.close()
+            await asyncio.sleep(0.5)
         else:
             raise NotImplementedError(f"Action type {self.type} is not implemented")
 
@@ -337,7 +283,7 @@ class ActionExecuteResult(TypedDict):
 
 @dataclass
 class ActionDetails:
-    action: Action
+    action: Action | None
     raw_action: str
     execute_result: ActionExecuteResult
     action_screenshot_path: Path

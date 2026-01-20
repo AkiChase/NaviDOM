@@ -35,7 +35,7 @@ class PlanningRecord(Record):
     new_progress: str | None
     current_state: str
     nearest_next_objective: str
-    future_plan: str
+    unfinished_content: str
     task_completed: bool
     time_line: TimeLine
 
@@ -44,9 +44,10 @@ class PlanningRecord(Record):
             json.dump(
                 {
                     "llm_details": self.llm_details,
+                    "new_progress": self.new_progress,
                     "current_state": self.current_state,
                     "nearest_next_objective": self.nearest_next_objective,
-                    "future_plan": self.future_plan,
+                    "unfinished_content": self.unfinished_content,
                     "task_completed": self.task_completed,
                 },
                 f,

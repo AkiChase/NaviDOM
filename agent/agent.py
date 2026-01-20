@@ -32,41 +32,22 @@ from agent.utils import (
 )
 
 
-class Agent:
+class TabManager:
     context: BrowserContext
     tab_dict: dict[int, Page]
+    tab_session_dict: dict[int, CDPSession]
     _next_tab_id: int
-    latest_tab_id: int
+    latest_tab_id: int | None
+    last_tab_id: int | None
 
-    out_dir: Path
-    user_request: str
-    font_18: ImageFont.FreeTypeFont | ImageFont.ImageFont
-    records: list[Record]
-    last_planning_record: PlanningRecord | None
-    last_act_record: ActRecord | None = None
-    last_observation_record: ObservationRecord | None
-    memory: list[tuple[str, str]]
-    progress: list[str]
-
-    def __init__(self, out_dir: Path, context: BrowserContext, user_request: str):
+    def __init__(self, context: BrowserContext) -> None:
         self.context = context
         self.tab_dict = {}
         self.tab_session_dict: dict[int, CDPSession] = {}
         self._next_tab_id = 1
-        self.latest_tab_id = 0
+        self.latest_tab_id = None
+        self.last_tab_id = None
         self.context.on("page", self._on_new_tab)
-
-        self.out_dir = out_dir
-        self.user_request = user_request
-        self.font_18 = load_default_font(18)
-        self.records = []
-        self.last_planning_record = None
-        self.last_act_record = None
-        self.last_observation_record = None
-        self.memory = []
-        self.progress = []
-
-        out_dir.mkdir(parents=True, exist_ok=True)
 
     def __del__(self):
         self.context.remove_listener("page", self._on_new_tab)
@@ -76,6 +57,7 @@ class Agent:
         self._next_tab_id += 1
         self.tab_dict[tab_id] = tab
         self.tab_session_dict[tab_id] = await tab.context.new_cdp_session(tab)
+        self.last_tab_id = self.latest_tab_id
         self.latest_tab_id = tab_id
         logger.debug(f"[TabManager] Tab opened, id={tab_id}, url={tab.url}")
         tab.on("close", lambda p: self._on_tab_closed(p, tab_id))
@@ -90,43 +72,79 @@ class Agent:
             logger.debug(f"[TabManager] Tab closed, id={tab_id}, url={tab.url}")
             if tab_id == self.latest_tab_id:
                 self.latest_tab_id = max(self.tab_dict.keys(), default=0)
+            if tab_id == self.last_tab_id:
+                self.last_tab_id = 0
 
     async def reset_context_tabs(self):
         for tab in reversed(self.context.pages):
             await tab.close()
         self.tab_dict = {}
         self._next_tab_id = 1
+        self.latest_tab_id = None
+        self.last_tab_id = None
 
         _ = await self.context.new_page()
         await asyncio.sleep(0.1)
 
-    def get_formatted_memory(self) -> str:
-        if not self.memory:
-            return "No entries."
-        return "\n".join([f"- {label}: {value}" for label, value in self.memory])
+    async def get_tabs_info(self) -> str:
+        tabs_info = [f"{id}. {await tab.title()} {unquote(tab.url)}" for id, tab in self.tab_dict.items()]
+        tabs_info.insert(0, f"Current Tab ID: {self.latest_tab_id}")
+        if self.last_tab_id is not None:
+            tabs_info[0] += f", Last Tab ID: {self.last_tab_id}"
+        return "\n".join(tabs_info)
+
+    @property
+    def front_tab(self) -> Page:
+        assert self.latest_tab_id is not None
+        return self.tab_dict[self.latest_tab_id]
+
+    @property
+    def front_tab_session(self) -> CDPSession:
+        assert self.latest_tab_id is not None
+        return self.tab_session_dict[self.latest_tab_id]
+
+
+class Agent:
+    context: BrowserContext
+    tab_manager: TabManager
+    out_dir: Path
+    user_request: str
+    font_18: ImageFont.FreeTypeFont | ImageFont.ImageFont
+    records: list[Record]
+    last_planning_record: PlanningRecord | None
+    last_act_record: ActRecord | None = None
+    last_observation_record: ObservationRecord | None
+    progress: list[str]
+
+    def __init__(self, out_dir: Path, context: BrowserContext, user_request: str):
+        self.context = context
+        self.tab_manager = TabManager(context)
+        self.out_dir = out_dir
+        self.user_request = user_request
+        self.font_18 = load_default_font(18)
+        self.records = []
+        self.last_planning_record = None
+        self.last_act_record = None
+        self.last_observation_record = None
+        self.progress = []
+
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     def get_formatted_progress(self) -> str:
         if not self.progress:
             return "No entries."
         return "\n".join([f"- {p}" for p in self.progress])
 
-    async def get_tabs_info(self) -> str:
-        return "\n".join(
-            [
-                f"{'[Active] ' if id == self.latest_tab_id else ''}{id}. {await tab.title()} {unquote(tab.url)}"
-                for id, tab in self.tab_dict.items()
-            ]
-        )
-
     async def run(self, start_url: str | None = None):
         start_time = datetime.now()
         # close all tabs
-        await self.reset_context_tabs()
+        await self.tab_manager.reset_context_tabs()
+        # TODO 先多运行几次看看有什么问题吧
         # TODO 对元素的css拼接还要增强
         # TODO 对iframe的处理(直接展开其中的子元素吧, DomNode需要有frameId标记和真实坐标，操作时也要对frameId进行判断)
         if start_url:
             logger.info(f"[Run] Start with URL: {start_url}")
-            await self.tab_dict[self.latest_tab_id].goto(start_url)
+            await self.tab_manager.front_tab.goto(start_url)
         else:
             # 初次导航
             await self.act_initial()
@@ -138,8 +156,8 @@ class Agent:
         while True:
             iteration_times += 1
 
-            before_act_screenshot = await tab_screenshot(self.tab_dict[self.latest_tab_id])
-            before_act_tabs_info = await self.get_tabs_info()
+            before_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
+            before_act_tabs_info = await self.tab_manager.get_tabs_info()
             last_error = None
             for act_time in range(1, Config.max_act_retry_times + 1):
                 # Act
@@ -182,7 +200,7 @@ class Agent:
         self.save_report(**out, out_dir=self.out_dir)
 
     async def observation(self, before_act_screenshot: Image.Image, before_act_tabs_info: str):
-        cur_tab = self.tab_dict[self.latest_tab_id]
+        cur_tab = self.tab_manager.front_tab
 
         time_line = TimeLine()
         record_index = len(self.records) + 1
@@ -192,19 +210,20 @@ class Agent:
             d for d in self.last_act_record.action_details_list if d.execute_result["success"]
         ]
         assert len(success_action_details_list) > 0
-        success_ui_change_action_list = [
-            d for d in success_action_details_list if d.action.type not in {ActionType.Extract, ActionType.Memory}
-        ]
+        success_ui_change_action_list = [d for d in success_action_details_list]
 
         after_act_screenshot = await tab_screenshot(cur_tab)
-        after_act_tabs_info = await self.get_tabs_info()
+        after_act_tabs_info = await self.tab_manager.get_tabs_info()
         tab_changed = before_act_tabs_info != after_act_tabs_info
         ui_changed = ImageChops.difference(before_act_screenshot, after_act_screenshot).getbbox() is not None
         if ui_changed or tab_changed:
             logger.info(f"[{record_index:03}] Observation")
             if success_ui_change_action_list:
                 actions_info = "\n".join(
-                    [f"{index}. {d.action.get_description()}" for index, d in enumerate(success_ui_change_action_list)]
+                    [
+                        f"{index}. {d.action.get_description() if d.action is not None else 'Parse Failed'}"
+                        for index, d in enumerate(success_ui_change_action_list)
+                    ]
                 )
             else:
                 actions_info = "No actions."
@@ -263,7 +282,7 @@ Important constraints:
         self.last_observation_record = record
 
     async def planning_initial(self):
-        cur_tab = self.tab_dict[self.latest_tab_id]
+        cur_tab = self.tab_manager.front_tab
         time_line = TimeLine()
         record_index = len(self.records) + 1
         logger.info(f"[{record_index:03}] Planning initial")
@@ -279,22 +298,22 @@ Your job is to analyze the current situation and produce a concise, structured p
 {self.user_request}
 
 ## Browser Tabs
-{await self.get_tabs_info()}
+{await self.tab_manager.get_tabs_info()}
 
 ## Requirements
 - Base the plan strictly on the provided User Request.
 - Do not assume information that is not visible in the UI screenshot.
 - Do not describe specific user actions or UI-level operations.
 - Focus on intent, current state, and goals rather than implementation details.
-- Output should follow the structure and headings below, and each section must be one concise sentence:
+- The output should be concise and strictly follow the structure and heading format below:
 [New Progress]
-Describe any meaningful progress already made toward the overall objective; if none, write exactly: NO_PROGRESS
+Describein concise sentences: any recordable and meaningful progress made toward the overall objective (e.g., completion of any part of the objective or intermediate results worth recording). If none, write: NO_PROGRESS
 [Current State]
-Describe what the tab page currently represents and and the current overall state of the task.
+Describe in one concise sentence: what the tab page currently represents and and the current overall state of the task.
 [Nearest Next Objective]
-State the single most immediate sub-goal that should be achieved next in order to move closer to the task objective. This should be concrete and actionable (e.g., “open login form”, “submit search query”, “navigate to checkout page”).
-[Future Plan]
-Outline the expected high-level steps that will follow AFTER the nearest next objective is completed. Keep this concise and forward-looking; do not describe low-level actions or UI mechanics.
+Describe in one concise sentence: the single most immediate sub-goal that should be achieved next in order to move closer to the task objective. This should be concrete and actionable (e.g., “open login form”, “submit search query”, “navigate to checkout page”).
+[Unfinished Content]
+Describe in one concise sentence: which specific requirements or sub-tasks from the User Request are still not completed or not addressed based on the current progress.
         """.strip()
 
         llm_details = await PrimaryLLM.chat_with_image_detail(prompt, screenshot)
@@ -315,21 +334,21 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
         assert match is not None
         current_state: str = match.group(1).strip()
 
-        pattern = re.compile(r"\[Nearest Next Objective\]\s*(.*?)\s*(?=\[Future Plan\]|\Z)", re.DOTALL)
+        pattern = re.compile(r"\[Nearest Next Objective\]\s*(.*?)\s*(?=\[Unfinished Content\]|\Z)", re.DOTALL)
         match = pattern.search(content)
         assert match is not None
         nearest_next_objective: str = match.group(1).strip()
 
-        pattern = re.compile(r"\[Future Plan\]\s*(.*)", re.DOTALL)
+        pattern = re.compile(r"\[Unfinished Content\]\s*(.*)", re.DOTALL)
         match = pattern.search(content)
         assert match is not None
-        future_plan: str = match.group(1).strip()
+        unfinished_content: str = match.group(1).strip()
 
         if not no_progress:
             logger.debug(f"[New Progress] {new_progress}")
         logger.debug(f"[Current State] {current_state}")
         logger.debug(f"[Nearest Next Objective] {nearest_next_objective}")
-        logger.debug(f"[Future Plan] {future_plan}")
+        logger.debug(f"[Unfinished Content] {unfinished_content}")
 
         time_line.add("end")
         record = PlanningRecord(
@@ -338,7 +357,7 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
             new_progress=None if no_progress else new_progress,
             current_state=current_state,
             nearest_next_objective=nearest_next_objective,
-            future_plan=future_plan,
+            unfinished_content=unfinished_content,
             task_completed=False,
             time_line=time_line,
         )
@@ -357,8 +376,8 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
 
         actions_info = "\n".join(
             [
-                f"{index}. {d.action.get_description()}"
-                for index, d in enumerate(self.last_act_record.action_details_list)
+                f"{index}. {d.action.get_description() if d.action is not None else 'Parse Failed'}"
+                for index, d in enumerate(self.last_act_record.action_details_list, 1)
                 if d.execute_result["success"]
             ]
         )
@@ -373,13 +392,17 @@ or determine that the task has already been completed.
 ## User Request
 {self.user_request}
 
-## Last Planning Details
-Last Task State: {self.last_planning_record.current_state}
-Last Nearest Next Objective: {self.last_planning_record.nearest_next_objective}
-Last Future Plan: {self.last_planning_record.future_plan}
+## Previous Planning Result
+Previous Task State: {self.last_planning_record.current_state}
+Previous Nearest Next Objective: {self.last_planning_record.nearest_next_objective}
+Previous Unfinished Content: {self.last_planning_record.unfinished_content}
 
-## Last Action Details
-The following information describes the actions executed in the previous step:
+## Historical Progress
+The following items represent the historical task progress recorded in historical iterations:
+{self.get_formatted_progress()}
+
+## Latest Action Details
+The following information describes the actions executed just now:
 {actions_info}
 
 ## Observation Details
@@ -387,32 +410,24 @@ This section contains Observation of the UI after the execution of actions in La
 If the UI did not change as expected, it may indicate that the previously planning was incorrect, and an alternative approach should be planned to achieve the task objective.
 Observation: {self.last_observation_record.observation}
 
-## Memory Entries
-The following items were stored related to the user request in previous iterations.
-They represent intermediate results that will be refined and returned to the user as part of the final task result.
-{self.get_formatted_memory()}
-
-## Historical Progress
-The following items represent the historical task progress recorded in previous iterations:
-{self.get_formatted_progress()}
-
 ## Requirements
 1. First, determine whether the user request has already been fully completed based on the current above information.
-2. If the task is completed, based strictly on the User Request, output the final task result. Do not add any extra content. Output exactly: TASK_COMPLETED, <result>
+2. If the task is completed, based strictly on the User Request, output the final task result in the exact format:
+TASK_COMPLETED, <result>
 3. If the task is not completed, reply according to the following rules:
 - Do not describe specific user actions or UI-level operations.
 - Focus on intent, current state, and goals rather than implementation details.
 - Base the plan strictly on: the provided User Request, Last Planning Details, Observation Details. Do not invent or assume information that is not explicitly provided.
 - Reflect task progress accurately; do not restate or repeat already completed objectives.
-- If the task is NOT completed, the output should be concise and strictly follow the structure and heading format below:
+- If the task is NOT completed, the output should strictly follow the structure and heading format below:
 [New Progress]
-Describe any NEW, meaningful progress toward the overall task objective; if none, write exactly: NO_PROGRESS
+Describe in one concise sentence: the NEW, recordable, meaningful progress toward the overall task objective; if none, write NO_PROGRESS
 [Current State]
-Describe what the tab page currently represents and and the current overall state of the task.
+Describe in one concise sentence: what the tab page currently represents and and the current overall state of the task.
 [Nearest Next Objective]
-State the single most immediate sub-goal that should be achieved next in order to move closer to the task objective. This should be concrete and actionable (e.g., “close dialogs”, “open login form”, “submit search query”, “navigate to checkout page”).
-[Future Plan]
-Outline the expected high-level steps that will follow AFTER the nearest next objective is completed. Keep this concise and forward-looking; do not describe low-level actions or UI mechanics.
+Describe in one concise sentence: the single most immediate sub-goal that should be achieved next in order to move closer to the task objective. This should be concrete and actionable (e.g., “close dialogs”, “open login form”, “submit search query”, “navigate to checkout page”).
+[Unfinished Content]
+Describe in one concise sentence: which specific requirements or sub-tasks from the User Request are still not completed or not addressed based on the current progress.
         """.strip()
 
         llm_details = await PrimaryLLM.chat_with_text_detail(prompt)
@@ -421,10 +436,10 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
         content = llm_details["content"].strip()
         no_progress = True
 
-        if content.startswith("TASK_COMPLETED"):
+        if content.find("TASK_COMPLETED") != -1:
             current_state = content.split(",", maxsplit=1)[1].strip()
             nearest_next_objective = ""
-            future_plan = ""
+            unfinished_content = ""
             task_completed = True
         else:
             pattern = re.compile(r"\[New Progress\]\s*(.*?)\s*(?=\[Current State\]|\Z)", re.DOTALL)
@@ -440,22 +455,22 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
             assert match is not None
             current_state: str = match.group(1).strip()
 
-            pattern = re.compile(r"\[Nearest Next Objective\]\s*(.*?)\s*(?=\[Future Plan\]|\Z)", re.DOTALL)
+            pattern = re.compile(r"\[Nearest Next Objective\]\s*(.*?)\s*(?=\[Unfinished Content\]|\Z)", re.DOTALL)
             match = pattern.search(content)
             assert match is not None
             nearest_next_objective: str = match.group(1).strip()
 
-            pattern = re.compile(r"\[Future Plan\]\s*(.*)", re.DOTALL)
+            pattern = re.compile(r"\[Unfinished Content\]\s*(.*)", re.DOTALL)
             match = pattern.search(content)
             assert match is not None
-            future_plan: str = match.group(1).strip()
+            unfinished_content: str = match.group(1).strip()
             task_completed = False
 
             if not no_progress:
                 logger.debug(f"[New Progress] {new_progress}")
             logger.debug(f"[Current State] {current_state}")
             logger.debug(f"[Nearest Next Objective] {nearest_next_objective}")
-            logger.debug(f"[Future Plan] {future_plan}")
+            logger.debug(f"[Unfinished Content] {unfinished_content}")
 
         time_line.add("end")
         record = PlanningRecord(
@@ -464,7 +479,7 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
             new_progress=None if no_progress else new_progress,
             current_state=current_state,
             nearest_next_objective=nearest_next_objective,
-            future_plan=future_plan,
+            unfinished_content=unfinished_content,
             task_completed=task_completed,
             time_line=time_line,
         )
@@ -473,8 +488,8 @@ Outline the expected high-level steps that will follow AFTER the nearest next ob
         self.last_planning_record = record
 
     async def act_initial(self):
-        cur_tab = self.tab_dict[self.latest_tab_id]
-        cdp_session = self.tab_session_dict[self.latest_tab_id]
+        cur_tab = self.tab_manager.front_tab
+        cdp_session = self.tab_manager.front_tab_session
 
         prompt = f"""
 You are a web AI agent designed to automate browser tasks.
@@ -504,7 +519,9 @@ User Request:
         llm_details = await PrimaryLLM.chat_with_text_detail(prompt)
         time_line.add("llm")
         raw_action = llm_details["content"]
-        action = Action.from_raw_action(uid=action_uid, raw_action=raw_action, dom_nodes=[], tab_dict=self.tab_dict)
+        action = Action.from_raw_action(
+            uid=action_uid, raw_action=raw_action, dom_nodes=[], tab_manager=self.tab_manager
+        )
         logger.debug(f"[Action] Construct 1 action: [{action.type.name}]")
 
         action_screenshot = await tab_screenshot(cur_tab)
@@ -514,7 +531,7 @@ User Request:
         action_screenshot.save(action_screenshot_path)
         execute_result: ActionExecuteResult = {
             "success": True,
-            "additional": await action.execute(cur_tab, cdp_session, self.memory, self.tab_dict),
+            "additional": await action.execute(cur_tab, cdp_session, self.tab_manager),
         }
 
         result_screenshot = await tab_screenshot(cur_tab)
@@ -543,8 +560,8 @@ User Request:
     async def act(self, last_error: str | None = None):
         record_index = len(self.records) + 1
         record_prefix = f"{record_index:03}_act"
-        cur_tab = self.tab_dict[self.latest_tab_id]
-        cdp_session = self.tab_session_dict[self.latest_tab_id]
+        cur_tab = self.tab_manager.front_tab
+        cdp_session = self.tab_manager.front_tab_session
 
         time_line = TimeLine()
         assert self.last_planning_record is not None
@@ -552,16 +569,8 @@ User Request:
         current_state = self.last_planning_record.current_state
         logger.info(f"[{record_index:03}] Act")
 
-        dom = await cdp_session.send("DOM.getDocument", {"depth": -1})
-        snapshot = await cdp_session.send(
-            "DOMSnapshot.captureSnapshot",
-            {
-                "computedStyles": ["display", "visibility", "opacity"],
-                "includeDOMRects": True,
-            },
-        )
-        viewport = dom_utils.Viewport(await cdp_session.send("Page.getLayoutMetrics"))
-        tree = dom_utils.parse_dom(dom, snapshot)
+        viewport = await dom_utils.Viewport.from_cdp_session(cdp_session)
+        tree = await dom_utils.load_dom(cdp_session)
 
         screenshot = await tab_screenshot(cur_tab)
         time_line.add("fetch")
@@ -750,7 +759,7 @@ Current State: {current_state}
 Nearest Next Objective: {next_objective}
 
 ## Browser Tabs
-{await self.get_tabs_info()}
+{await self.tab_manager.get_tabs_info()}
 
 ## Active Tab State
 {viewport.get_tab_page_info()}
@@ -758,7 +767,7 @@ Interactive Elements. Each element is prefixed with a unique [backend_node_id]:
 {pruned_dom_repr}
 
 ## Available Actions
-{Action.get_format_prompt()}
+{Action.get_format_prompt(include_types=None, exclude_types=[ActionType.Search])}
 
 {error_prompt}
 ## Requirements
@@ -775,19 +784,39 @@ Do NOT include explanations or any additional text.
         raw_action_list = [line for line in llm_action_res.strip().split("\n") if line.strip()]
         raw_action_types = [raw_action.split(",", maxsplit=1)[0].strip() for raw_action in raw_action_list]
         logger.debug(f"[Action] Generate {len(raw_action_list)} actions: [{', '.join(raw_action_types)}]")
+        old_tab_id = self.tab_manager.latest_tab_id
+
         for action_index, raw_action in enumerate(raw_action_list, 1):
+            if self.tab_manager.latest_tab_id != old_tab_id:
+                logger.debug(f"[Action] Tab changed, skip rest {len(raw_action_list) - action_index + 1} actions")
+                break
+
+            # 重新获取页面节点
+            tree = await dom_utils.load_dom(cdp_session)
+            Pruning.trim_dom_tree_by_visibility(tree, viewport)
+            Pruning.filter_dom_tree_by_node(tree)
+            Pruning.promote_dom_tree_children(tree)
+            Pruning.merge_dom_tree_children(tree)
+            Pruning.clean_dom_tree_attrs(tree)
+            cur_interactive_nodes = Pruning.extract_interactive_nodes(tree)
+
             action_uid = gen_uid()
             action_prefix = f"{record_prefix}_{action_index:03}_{action_uid}"
             logger.debug(f"[Action] {action_index}. {raw_action}")
             action_screenshot = await tab_screenshot(cur_tab)
             action_screenshot_draw = ImageDraw.Draw(action_screenshot)
+            draw_text_label(
+                action_screenshot_draw,
+                text=raw_action if len(raw_action) < 15 else f"{raw_action[:15]}...",
+                position=(10, 10),
+                font=self.font_18,
+            )
             try:
                 # parse action
                 action = Action.from_raw_action(
-                    uid=action_uid, raw_action=raw_action, dom_nodes=final_nodes, tab_dict=self.tab_dict
+                    uid=action_uid, raw_action=raw_action, dom_nodes=cur_interactive_nodes, tab_manager=self.tab_manager
                 )
-                # record action
-                draw_text_label(action_screenshot_draw, text=action.type.name, position=(10, 10), font=self.font_18)
+                # draw action target
                 if action.target is not None:
                     action.target.draw_bounds(
                         action_screenshot_draw,
@@ -801,42 +830,39 @@ Do NOT include explanations or any additional text.
                 action_screenshot_path = self.out_dir / f"{action_prefix}_action.jpg"
                 action_screenshot.save(action_screenshot_path)
 
+                # execute action
                 execute_result: ActionExecuteResult = {
                     "success": True,
-                    "additional": await action.execute(cur_tab, cdp_session, self.memory, self.tab_dict),
+                    "additional": await action.execute(cur_tab, cdp_session, self.tab_manager),
                 }
                 # update latest tab
-                cur_tab = self.tab_dict[self.latest_tab_id]
-                cdp_session = self.tab_session_dict[self.latest_tab_id]
+                cur_tab = self.tab_manager.front_tab
+                cdp_session = self.tab_manager.front_tab_session
 
                 result_screenshot = await tab_screenshot(cur_tab)
                 result_screenshot_path = self.out_dir / f"{action_prefix}_result.jpg"
                 result_screenshot.save(result_screenshot_path)
             except ActionParseException as e:
                 logger.warning(f"[Act] Parse action failed, {e}. Action: {raw_action}")
-                draw_text_label(
-                    action_screenshot_draw,
-                    text=raw_action.split(",", maxsplit=1)[0].strip(),
-                    position=(10, 10),
-                    font=self.font_18,
-                )
                 draw_text_label(action_screenshot_draw, text=str(e), position=(10, 40), font=self.font_18)
                 action_screenshot_path = self.out_dir / f"{action_prefix}_error.jpg"
-                result_screenshot_path = action_screenshot_path  # the same
                 action_screenshot.save(action_screenshot_path)
+                result_screenshot_path = action_screenshot_path  # the same
                 execute_result: ActionExecuteResult = {
                     "success": False,
                     "additional": str(e),
                 }
+                action = None
             except ActionExecuteException as e:
+                assert action is not None
                 logger.warning(f"[Act] Execute {action.type.value} action failed: {e}")
                 execute_result: ActionExecuteResult = {
                     "success": False,
                     "additional": str(e),
                 }
                 # update latest tab
-                cur_tab = self.tab_dict[self.latest_tab_id]
-                cdp_session = self.tab_session_dict[self.latest_tab_id]
+                cur_tab = self.tab_manager.front_tab
+                cdp_session = self.tab_manager.front_tab_session
 
                 result_screenshot = await tab_screenshot(cur_tab)
                 result_screenshot_path = self.out_dir / f"{action_prefix}_error.jpg"
@@ -903,7 +929,7 @@ Do NOT include explanations or any additional text.
                         "actions": [
                             {
                                 "raw": d.raw_action,
-                                "description": d.action.get_description(),
+                                "description": d.action.get_description() if d.action is not None else "Parse Failed",
                                 "success": d.execute_result["success"],
                                 "action_screenshot_name": d.action_screenshot_path.name,
                                 "result_screenshot_name": d.result_screenshot_path.name,
@@ -956,7 +982,7 @@ Do NOT include explanations or any additional text.
                             "type": "planning",
                             "current_state": record.current_state,
                             "nearest_next_objective": record.nearest_next_objective,
-                            "future_plan": record.future_plan,
+                            "unfinished_content": record.unfinished_content,
                             "task_completed": record.task_completed,
                             "time_cost": round(record.time_line.total_time(), 4),
                             "token_usage": {
@@ -1113,13 +1139,17 @@ Do NOT include explanations or any additional text.
                 report_lines.append("")
 
                 if not record["task_completed"]:
+                    report_lines.append("**New Progress:**")
+                    report_lines.append(record.get("new_progress", ""))
+                    report_lines.append("")
+
                     report_lines.append("**Nearest Next Objective:**")
                     report_lines.append(record.get("nearest_next_objective", ""))
                     report_lines.append("")
 
                     report_lines.append("")
-                    report_lines.append("**Future Plan:**")
-                    report_lines.append(record.get("future_plan", ""))
+                    report_lines.append("**Unfinished Content:**")
+                    report_lines.append(record.get("unfinished_content", ""))
                     report_lines.append("")
                 report_lines.append("")
 

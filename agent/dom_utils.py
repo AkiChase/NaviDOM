@@ -6,7 +6,7 @@ from typing import Any, Optional
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
-from playwright.async_api import Page
+from playwright.async_api import Page, CDPSession
 
 import tiktoken
 from PIL import ImageFont, ImageDraw, Image
@@ -50,6 +50,10 @@ class Viewport:
         self.total_height = float(content["height"])
         self.total_width = float(content["width"])
 
+    @staticmethod
+    async def from_cdp_session(cdp_session: CDPSession):
+        return Viewport(await cdp_session.send("Page.getLayoutMetrics"))
+
     @property
     def remaining_up_pages(self) -> float:
         return max(self.page_y / self.client_h, 0.0)
@@ -64,9 +68,9 @@ class Viewport:
         down = self.remaining_down_pages
         parts: list[str] = []
         if up > 0:
-            parts.append(f"Scrollable up: {up:.2f} pages")
+            parts.append(f"Scrollable up: {up:.1f} pages")
         if down > 0:
-            parts.append(f"Scrollable down: {down:.2f} pages")
+            parts.append(f"Scrollable down: {down:.1f} pages")
 
         return ", ".join(parts)
 
@@ -127,6 +131,14 @@ class DomNode:
 
     def __repr__(self):
         return f"<DomNode {self.local_name} backend_node_id={self.backend_node_id}>"
+
+    @property
+    def editable(self) -> bool:
+        if self.local_name in ["input", "textarea"]:
+            return True
+        if self.attributes.get("contenteditable") == "true":
+            return True
+        return False
 
     def _build_selector_candidates(self) -> list[str]:
         selectors = []
@@ -351,7 +363,16 @@ class DomNode:
             return self._ancestor_set
 
 
-def parse_dom(dom_json: dict[str, Any], dom_snapshot: dict[str, Any]) -> DomNode:
+async def load_dom(cdp_session: CDPSession) -> DomNode:
+    dom_json = await cdp_session.send("DOM.getDocument", {"depth": -1})
+    dom_snapshot = await cdp_session.send(
+        "DOMSnapshot.captureSnapshot",
+        {
+            "computedStyles": ["display", "visibility", "opacity"],
+            "includeDOMRects": True,
+        },
+    )
+
     dom_snapshot_strings = dom_snapshot["strings"]
     bounds_dict = {}
     visible_dict = {}

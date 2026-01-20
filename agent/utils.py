@@ -158,3 +158,7 @@ def format_time_delta(start: datetime | float, end: datetime | float, with_ms: b
 def google_search_url(keywords: str) -> str:
     encoded = quote(keywords, safe="")
     return f"https://www.google.com/search?q={encoded}"
+
+def bing_search_url(keywords: str) -> str:
+    encoded = quote(keywords, safe="")
+    return f"https://www.bing.com/search?q={encoded}"
