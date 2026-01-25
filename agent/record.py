@@ -34,6 +34,7 @@ class PlanningRecord(Record):
     llm_details: ChatTextDetails | ChatImageDetails
     new_progress: str | None
     current_state: str
+    action_reflection: str | None
     nearest_next_objective: str
     unfinished_content: str
     task_completed: bool
@@ -46,6 +47,7 @@ class PlanningRecord(Record):
                     "llm_details": self.llm_details,
                     "new_progress": self.new_progress,
                     "current_state": self.current_state,
+                    "action_reflection": self.action_reflection,
                     "nearest_next_objective": self.nearest_next_objective,
                     "unfinished_content": self.unfinished_content,
                     "task_completed": self.task_completed,

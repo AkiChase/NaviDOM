@@ -9,11 +9,8 @@ from agent.llm import PrimaryLLM, SecondaryLLM
 
 class Config:
     debug: bool
-    browser_headless: bool
-    browser_executable_path: str | None
     browser_viewport_w: int
     browser_viewport_h: int
-    max_act_retry_times: int
     max_iteration_times: int
 
     @classmethod
@@ -35,12 +32,9 @@ class Config:
 
         cls.debug = env.get("debug", False)
         browser_config = env.get("browser", {})
-        cls.browser_headless = browser_config.get("headless", False)
-        cls.browser_executable_path = browser_config.get("executable_path", None)
         viewport = browser_config.get("viewport", {})
         cls.browser_viewport_w = viewport.get("width", 1280)
         cls.browser_viewport_h = viewport.get("height", 720)
-        cls.max_act_retry_times = env.get("max_act_retry_times", 3)
         cls.max_iteration_times = env.get("max_iteration_times", 10)
 
         primary_llm_service = env["primary_llm_service"]

@@ -3,17 +3,14 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TypedDict
-import typing
 
 from agent.config import Config
-from agent.dom_utils import DomNode
-from playwright.async_api import Page, CDPSession
+from agent.dom import DomNode
+from playwright.async_api import Page
 
 from agent.llm import ChatImageDetails
 from agent.utils import SpecialException, bing_search_url
-
-if typing.TYPE_CHECKING:
-    from agent.agent import TabManager
+from agent.tab import TabManager
 
 
 class ActionParseException(SpecialException):
@@ -33,18 +30,23 @@ class ActionType(Enum):
     Search = "SEARCH"
     TabSwitch = "TAB_SWITCH"
     TabClose = "TAB_CLOSE"
+    SaveInfo = "SAVE_INFO"
+    # ExtractAndSaveInfo = "EXTRACT_AND_SAVE_INFO"
 
 
 action_format_prompt = {
-    ActionType.Click: "CLICK, <backend_node_id>",
-    ActionType.Input: "INPUT, <backend_node_id>, <clear:true|false>, <text>\t// In <text>, only \\n has special meaning for line breaks; no other escaping is required",
+    ActionType.Click: "CLICK, <node_id>",
+    ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// The target node must be editable (input or textarea). In <text>, only \\n has special meaning for line breaks; no other escaping is required",
     ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>",
     ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.Navigate: "NAVIGATE, <url>\t// Navigate to the specified URL",
     ActionType.Search: "SEARCH, <keywords>\t// Navigate to Bing search results for the given keywords",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to and activate the specified tab",
     ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
+    ActionType.SaveInfo: "SAVE_INFO, <content>\t// If the user request requires certain information to be output, store <content> (\\n for line breaks) using this action.",
+    # ActionType.ExtractAndSaveInfo: "EXTRACT_AND_SAVE_INFO, <subject>\t// The text in provided Interactive Nodes may be truncated with '...'. Use this action as an enhanced version of SAVE_INFO to extract content related to <subject> from the full text and store it.",
 }
+
 all_action_types = [
     ActionType.Click,
     ActionType.Input,
@@ -94,21 +96,21 @@ class Action:
         parts = [p.strip() for p in raw_action.split(",", maxsplit=1)]
         action_type = ActionType(parts[0].upper())
 
-        def find_target(backend_node_id: str) -> DomNode:
-            target_id = int(backend_node_id.strip("[]<>"))
+        def find_target(local_id: str) -> DomNode:
+            target_id = int(local_id.strip("[]<>"))
             for node in dom_nodes:
-                target = node.find_nodes_by_backend_node_ids([target_id])[0]
+                target = node.find_children_by_local_ids([target_id])[0]
                 if target is not None:
                     return target
-            raise ActionParseException(f"backend_node_id [{target_id}] not found")
+            raise ActionParseException(f"Node[{target_id}] not found")
 
         if action_type == ActionType.Click:
-            # CLICK, <backend_node_id>
+            # CLICK, <local_id>
             assert len(parts) == 2, ActionParseException(f"Invalid CLICK format: {raw_action}")
             target = find_target(parts[1])
             return Action(uid, action_type, target, {})
         elif action_type == ActionType.Input:
-            # INPUT, <backend_node_id>, <clear>, <text>
+            # INPUT, <local_id>, <clear>, <text>
             assert len(parts) == 2, ActionParseException(f"Invalid INPUT format: {raw_action}")
             sub_parts = [p.strip() for p in parts[1].split(",", maxsplit=2)]
             assert len(sub_parts) == 3, ActionParseException(f"Invalid INPUT format: {raw_action}")
@@ -164,78 +166,51 @@ class Action:
             if tab_id not in tab_manager.tab_dict:
                 raise ActionParseException(f"Tab ID {tab_id} not found")
             return Action(uid, action_type, None, {"tab_id": tab_id})
+        elif action_type == ActionType.SaveInfo:
+            # SAVE_INFO, <content>
+            assert len(parts) == 2, ActionParseException(f"Invalid SAVE_INFO format: {raw_action}")
+            content = parts[1].replace("\\n", "\n")
+            return Action(uid, action_type, None, {"content": content})
         else:
             raise ActionParseException(f"Unsupported action type: {action_type}")
 
-    async def execute(self, tab: Page, cdp_session: CDPSession, tab_manager: "TabManager"):
+    async def execute(self, tab: Page, tab_manager: "TabManager", storage: list[str]):
         # 简单实现
-        node = None
-        if self.type in [ActionType.Click, ActionType.Input]:
-            assert self.target is not None
 
+        if self.type in [ActionType.Click, ActionType.Input]:
+            # find target in tab
+            assert self.target is not None
+            if self.type == ActionType.Click and not self.target.clickable:
+                raise ActionExecuteException(f"Target node {self.target.get_description(full=False)} is not clickable")
+            if self.type == ActionType.Input and not self.target.editable:
+                raise ActionExecuteException(f"Target node {self.target.get_description(full=False)} is not editable")
+
+            frame = await self.target.find_owner_frame(tab)
+            if frame is None:
+                raise ActionExecuteException(f"Target {self.target.get_description(full=False)} owner frame not found")
+            loc = await self.target.find_locator_in_frame(frame)
+            if loc is None:
+                raise ActionExecuteException(
+                    f"Target {self.target.get_description(full=False)} locator not found in frame"
+                )
+
+            # execute click/input action
             if self.type == ActionType.Click:
-                loc = await self.target.find_node_in_tab(tab)
-                if loc is not None:
-                    try:
-                        await loc.click(timeout=300)
-                    except Exception as e:
-                        raise ActionExecuteException(f"Failed to click: {e}")
-                else:
-                    node = await cdp_session.send("DOM.resolveNode", {"backendNodeId": self.target.backend_node_id})
-                    if "object" not in node or "objectId" not in node["object"]:
-                        raise ActionExecuteException("Failed to get object ID for element")
-                    object_id = node["object"]["objectId"]
-                    await cdp_session.send(
-                        "Runtime.callFunctionOn",
-                        {
-                            "objectId": object_id,
-                            "functionDeclaration": """function() {
-                                this.click();
-                            }
-                            """,
-                        },
-                    )
+                try:
+                    await loc.click(timeout=300, force=True)
+                except Exception as e:
+                    raise ActionExecuteException(f"Failed to click: {e}")
                 await asyncio.sleep(1.5)
             elif self.type == ActionType.Input:
-                if not self.target.editable:
-                    raise ActionExecuteException(f"Target {self.target} is not editable")
-                
                 clear = self.extra["clear"]
                 text = self.extra["text"]
-                loc = await self.target.find_node_in_tab(tab)
-                if loc is not None:
-                    try:
-                        if clear:
-                            await loc.fill(text, timeout=300)
-                        else:
-                            await loc.type(text, timeout=300)
-                    except Exception as e:
-                        raise ActionExecuteException(f"Failed to click: {e}")
-                else:
-                    node = await cdp_session.send("DOM.resolveNode", {"backendNodeId": self.target.backend_node_id})
-                    if "object" not in node or "objectId" not in node["object"]:
-                        raise ActionExecuteException("Failed to get object ID for element")
-                    object_id = node["object"]["objectId"]
-                    await cdp_session.send("DOM.focus", {"objectId": object_id})
+                try:
                     if clear:
-                        value_stmt = "try { this.select(); } catch (e) {}\n"
-                        value_stmt += f'this.value = "{text}";'
+                        await loc.fill(text, timeout=300)
                     else:
-                        value_stmt = f'this.value += "{text}";'
-
-                    await cdp_session.send(
-                        "Runtime.callFunctionOn",
-                        {
-                            "objectId": object_id,
-                            "functionDeclaration": """function() {
-                            <Mask>
-                            this.dispatchEvent(new Event("input", { bubbles: true }));
-                            this.dispatchEvent(new Event("change", { bubbles: true }));
-                        }""".replace(
-                                "<Mask>", value_stmt
-                            ),
-                        },
-                    )
+                        await loc.type(text, timeout=300)
+                except Exception as e:
+                    raise ActionExecuteException(f"Failed to click: {e}")
                 await asyncio.sleep(1.5)
         elif self.type == ActionType.Scroll:
             pages = self.extra["pages"]
@@ -259,8 +234,12 @@ class Action:
             await asyncio.sleep(1)
         elif self.type == ActionType.TabSwitch:
             tab_id = self.extra["tab_id"]
+            if tab_id == tab_manager.latest_tab_id:
+                raise ActionExecuteException(
+                    f"Tab ID {tab_id} is already the current tab, you may want to scroll the tab page"
+                )
             if tab_id not in tab_manager.tab_dict:
-                raise ActionExecuteException(f"Tab ID {tab_id} not found")
+                raise ActionExecuteException(f"Tab ID {tab_id} not found in available tabs")
             tab = tab_manager.tab_dict[tab_id]
             tab_manager.latest_tab_id = tab_id
             await tab.bring_to_front()
@@ -272,6 +251,9 @@ class Action:
             tab = tab_manager.tab_dict[tab_id]
             await tab.close()
             await asyncio.sleep(0.5)
+        elif self.type == ActionType.SaveInfo:
+            content = self.extra["content"]
+            storage.append(content)
         else:
             raise NotImplementedError(f"Action type {self.type} is not implemented")
 

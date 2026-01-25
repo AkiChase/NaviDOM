@@ -13,16 +13,19 @@ async def run_agent(
 ):
     Config.init("env.json", out_dir)
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            executable_path=Config.browser_executable_path,
-            headless=Config.browser_headless,
-        )
-        context = await browser.new_context(
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir="local/data",
+            headless=False,
+            args=[
+                f"--disable-extensions-except=local/I-Still-Dont-Care-About-Cookies",
+                f"--load-extension=local/I-Still-Dont-Care-About-Cookies",
+            ],
             viewport={
                 "width": Config.browser_viewport_w,
                 "height": Config.browser_viewport_h,
-            }
+            },
         )
+
         out_dir.mkdir(parents=True, exist_ok=True)
         agent = Agent(
             out_dir=out_dir,
@@ -39,7 +42,7 @@ if __name__ == "__main__":
     asyncio.run(
         run_agent(
             out_dir=Path("output/test"),
-            task="Find the store location and Business Hours of the closest Trader Joe's to zip code 90028 and set it as my home store. You must find the Business Hours of it",
+            task="Find the store location and Business Hours of the closest Trader Joe's to zip code 90028 and set it as my home store.",
             start_url="https://www.traderjoes.com/",
         )
     )

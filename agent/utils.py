@@ -32,8 +32,8 @@ bg_colors = [
 ]
 
 
-async def tab_screenshot(page: Page):
-    screenshot_bytes = await page.screenshot(full_page=False, type="jpeg")
+async def tab_screenshot(tab: Page):
+    screenshot_bytes = await tab.screenshot(full_page=False, type="jpeg")
     return Image.open(BytesIO(screenshot_bytes))
 
 
