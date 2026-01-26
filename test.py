@@ -14,7 +14,7 @@ async def run_agent(
     Config.init("env.json", out_dir)
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
-            user_data_dir="local/data",
+            user_data_dir="",
             headless=False,
             args=[
                 f"--disable-extensions-except=local/I-Still-Dont-Care-About-Cookies",
@@ -25,6 +25,8 @@ async def run_agent(
                 "height": Config.browser_viewport_h,
             },
         )
+        await context.clear_cookies()
+        await context.add_init_script(path="agent/scripts/cssSelectorGenerator.js")
 
         out_dir.mkdir(parents=True, exist_ok=True)
         agent = Agent(

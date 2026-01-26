@@ -23,6 +23,7 @@ from agent.record import ActRecord, ObservationRecord, PlanningRecord, Record, T
 from agent.tab import TabManager
 from agent.utils import (
     draw_text_label,
+    format_seconds,
     format_time_delta,
     gen_uid,
     load_default_font,
@@ -42,7 +43,7 @@ class Agent:
     last_act_record: ActRecord | None = None
     last_observation_record: ObservationRecord | None
     progress: list[str]
-    storage: list[str]
+    memory: list[str]
 
     def __init__(self, out_dir: Path, context: BrowserContext, user_request: str):
         self.context = context
@@ -55,7 +56,7 @@ class Agent:
         self.last_act_record = None
         self.last_observation_record = None
         self.progress = []
-        self.storage = []
+        self.memory = []
 
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -64,10 +65,10 @@ class Agent:
             return "No entries."
         return "\n".join(self.progress)
 
-    def get_formatted_storage(self) -> str:
-        if not self.storage:
+    def get_formatted_memory(self) -> str:
+        if not self.memory:
             return "No entries."
-        return "\n".join(self.storage)
+        return "\n".join(self.memory)
 
     async def run(self, start_url: str | None = None):
         start_time = datetime.now()
@@ -109,6 +110,9 @@ class Agent:
 
         end_time = datetime.now()
         logger.info(f"[Time] Total time cost: {format_time_delta(start_time, end_time)}")
+        logger.info(
+            f"[Time] Per act time cost: {(end_time - start_time).total_seconds() / len([r for r in self.records if isinstance(r, ActRecord)]):.2f}s"
+        )
         out = self.save_result((end_time - start_time).total_seconds())
         self.save_report(**out, out_dir=self.out_dir)
 
@@ -203,17 +207,17 @@ You are a web AI agent designed to make a planning to accomplish the given user 
 Your job is to analyze the current situation and produce a concise, structured plan.
 
 ## Requirements
-- Base the plan strictly on the provided User Request.
-- Do not assume information that is not visible in the UI screenshot.
-- Do not describe specific user actions or UI-level operations.
-- Focus on intent, current state, and goals rather than implementation details.
-- The output should be concise and strictly follow the structure and heading format below:
+- Do not invent or assume information that is not explicitly provided.
+- The user-requested information must be explicitly recorded in Stored Memory; when it is observable on the page, set recording it as the Nearest Next Objective.
+- If modal or alert exists on the page, set close it as the Nearest Next Objective;
+- The output should strictly follow the structure and heading format below:
 [New Progress]
-Describe in one concise sentence: the NEW, recordable, meaningful progress toward the overall task objective; if none, write NO_PROGRESS
+If no progress is made, write explicitly NO_PROGRESS
+Else, describe in one concise sentence: the NEW, recordable, meaningful progress toward the User Request.
 [Current State]
 Describe in one concise sentence: what the tab page currently represents and and the current overall state of the task.
 [Nearest Next Objective]
-Describe in one concise sentence: the single most immediate sub-goal that should be achieved next in order to move closer to the task objective. This should be concrete and actionable (e.g., “close dialogs”, “open login form”, “submit search query”).
+Describe in one concise sentence: the single most immediate, concrete, actionable sub-goal to advance the task.
 [Unfinished Content]
 Describe in one concise sentence: which specific requirements or sub-tasks from the User Request are still not completed or not addressed based on the current progress.
 
@@ -222,11 +226,6 @@ Describe in one concise sentence: which specific requirements or sub-tasks from 
 
 ## Browser Tabs
 {await self.tab_manager.get_tabs_info()}
-
-## Suggestions
-- If cookie modal or other alert exists, you should close it in next step.
-- If the observed UI did not change as expected, it may indicate that the previously planning or action were incorrect, please plan other Nearest Next Objective.
-- If user request info is available on the screen, you should explicitly store the specific info in next step.
         """.strip()
 
         llm_details = await PrimaryLLM.chat_with_image_detail(prompt, screenshot)
@@ -306,25 +305,25 @@ You are a web AI agent designed to make a planning to accomplish the given user 
 Your job is to analyze the current situation and produce a concise, structured plan, or determine that the task has already been completed.
 
 ## Requirements
-1. First, determine whether the user request has already been fully completed based on the current above information.
-2. If the task is completed, ignore other parts of the output and only output the final task result in the exact format:
-TASK_COMPLETED, <user request output>
-3. If the task is not completed, reply according to the following rules:
-- Do not describe specific user actions or UI-level operations.
-- Focus on intent, current state, and goals rather than implementation details.
-- Base the plan strictly on: the provided User Request, Last Planning Details, Observation Details. Do not invent or assume information that is not explicitly provided.
-- Reflect task progress accurately; do not restate or repeat already completed objectives.
-- If the task is NOT completed, the output should strictly follow the structure and heading format below:
+- Do not invent or assume information that is not explicitly provided.
+- The user-requested information must be explicitly recorded in Stored Memory; when it is observable on the page, set recording it as the Nearest Next Objective.
+- If modal or alert exists on the page, set close it as the Nearest Next Objective;
+- The output should strictly follow the structure and heading format below:
 [New Progress]
-Describe in one concise sentence: the NEW, recordable, meaningful progress toward the overall task objective; if none, write NO_PROGRESS
+If no progress is made, write explicitly: NO_PROGRESS
+Else, describe in one concise sentence: the NEW, meaningful progress toward the User Request.
 [Current State]
-Describe in one concise sentence: what the tab page currently represents and and the current overall state of the task.
+If the task is totally completed, write explicitly: TASK_COMPLETED, <user request required output>
+Else, describe in one concise sentence: the current overall task state, indicating what has been achieved so far and where the task stands now.
 [Action reflection]
-Describe in one concise sentence: analyze the result of the latest action execution to specify any mistakes, risks, or constraints that the next action should avoid; if none, write NO_REFLECTION
+If the latest action execution works well, write explicitly: NO_REFLECTION.
+Else, describe in one concise sentence: analyze the result of the latest action execution to specify any mistakes, risks, or constraints that the next action should avoid.
 [Nearest Next Objective]
-Describe in one concise sentence: the single most immediate sub-goal that should be achieved next in order to move closer to the task objective. This should be concrete and actionable (e.g., “close dialogs”, “open login form”, “submit search query”).
+If the task is totally completed, write explicitly: TASK_COMPLETED.
+Else, describe in one concise sentence: the single most immediate, concrete, actionable sub-goal to advance the task
 [Unfinished Content]
-Describe in one concise sentence: which specific requirements or sub-tasks from the User Request are still not completed or not addressed based on the current progress.
+If the task is totally completed, write explicitly: TASK_COMPLETED.
+Else, describe in one concise sentence: which specific requirements or sub-tasks from the User Request are still not completed or not addressed based on the current progress.
 
 ## User Request
 {self.user_request}
@@ -338,9 +337,9 @@ Previous Unfinished Content: {self.last_planning_record.unfinished_content}
 The task progress entries recorded in historical iterations:
 {self.get_formatted_progress()}
 
-## Stored Information
-The stored information related to the user request output in historical STORE_INFO actions:
-{self.get_formatted_storage()}
+## Stored Memory
+The stored information related to the user request output in historical actions:
+{self.get_formatted_memory()}
 
 ## Latest Action Details
 The following information describes the actions executed just now:
@@ -349,11 +348,6 @@ The following information describes the actions executed just now:
 ## Observation Details
 This section contains Observation of the UI after the execution of actions in Last Action Details.
 Observation: {self.last_observation_record.observation}
-
-## Suggestions
-- If cookie modal or other alert exists, you should close it in next step.
-- If the observed UI did not change as expected, it may indicate that the previously planning or action were incorrect, please plan other Nearest Next Objective.
-- If user request info is available on the screen, you should explicitly store the specific info in next step.
         """.strip()
 
         llm_details = await PrimaryLLM.chat_with_text_detail(prompt)
@@ -362,51 +356,45 @@ Observation: {self.last_observation_record.observation}
         content = llm_details["content"].strip()
         no_progress = True
         no_reflection = True
+        task_completed = False
 
-        if content.find("TASK_COMPLETED") != -1:
-            current_state = content.split(",", maxsplit=1)[1].strip()
-            nearest_next_objective = ""
-            unfinished_content = ""
+        pattern = re.compile(r"\[New Progress\]\s*(.*?)\s*(?=\[Current State\]|\Z)", re.DOTALL)
+        match = pattern.search(content)
+        assert match is not None
+        new_progress: str = match.group(1).strip()
+        if new_progress.upper().find("NO_PROGRESS") == -1:
+            self.progress.append(new_progress)
+            no_progress = False
+
+        pattern = re.compile(r"\[Current State\]\s*(.*?)\s*(?=\[Action reflection\]|\Z)", re.DOTALL)
+        match = pattern.search(content)
+        assert match is not None
+        current_state: str = match.group(1).strip()
+        if current_state.upper().find("TASK_COMPLETED") != -1:
             task_completed = True
-        else:
-            pattern = re.compile(r"\[New Progress\]\s*(.*?)\s*(?=\[Current State\]|\Z)", re.DOTALL)
-            match = pattern.search(content)
-            assert match is not None
-            new_progress: str = match.group(1).strip()
-            if new_progress.upper().find("NO_PROGRESS") == -1:
-                self.progress.append(new_progress)
-                no_progress = False
 
-            pattern = re.compile(r"\[Current State\]\s*(.*?)\s*(?=\[Action reflection\]|\Z)", re.DOTALL)
-            match = pattern.search(content)
-            assert match is not None
-            current_state: str = match.group(1).strip()
+        pattern = re.compile(r"\[Action reflection\]\s*(.*?)\s*(?=\[Nearest Next Objective\]|\Z)", re.DOTALL)
+        match = pattern.search(content)
+        assert match is not None
+        action_reflection: str = match.group(1).strip()
+        if action_reflection.upper().find("NO_REFLECTION") == -1:
+            no_reflection = False
 
-            pattern = re.compile(r"\[Action reflection\]\s*(.*?)\s*(?=\[Nearest Next Objective\]|\Z)", re.DOTALL)
-            match = pattern.search(content)
-            assert match is not None
-            action_reflection: str = match.group(1).strip()
-            if action_reflection.upper().find("NO_REFLECTION") == -1:
-                no_reflection = False
+        pattern = re.compile(r"\[Nearest Next Objective\]\s*(.*?)\s*(?=\[Unfinished Content\]|\Z)", re.DOTALL)
+        match = pattern.search(content)
+        assert match is not None
+        nearest_next_objective: str = match.group(1).strip()
 
-            pattern = re.compile(r"\[Nearest Next Objective\]\s*(.*?)\s*(?=\[Unfinished Content\]|\Z)", re.DOTALL)
-            match = pattern.search(content)
-            assert match is not None
-            nearest_next_objective: str = match.group(1).strip()
+        pattern = re.compile(r"\[Unfinished Content\]\s*(.*)", re.DOTALL)
+        match = pattern.search(content)
+        assert match is not None
+        unfinished_content: str = match.group(1).strip()
 
-            pattern = re.compile(r"\[Unfinished Content\]\s*(.*)", re.DOTALL)
-            match = pattern.search(content)
-            assert match is not None
-            unfinished_content: str = match.group(1).strip()
-            task_completed = False
-
-            if not no_progress:
-                logger.debug(f"[New Progress] {new_progress}")
-            if not no_reflection:
-                logger.debug(f"[Action reflection] {action_reflection}")
-            logger.debug(f"[Current State] {current_state}")
-            logger.debug(f"[Nearest Next Objective] {nearest_next_objective}")
-            logger.debug(f"[Unfinished Content] {unfinished_content}")
+        logger.debug(f"[New Progress] {new_progress}")
+        logger.debug(f"[Action reflection] {action_reflection}")
+        logger.debug(f"[Current State] {current_state}")
+        logger.debug(f"[Nearest Next Objective] {nearest_next_objective}")
+        logger.debug(f"[Unfinished Content] {unfinished_content}")
 
         time_line.add("end")
         record = PlanningRecord(
@@ -467,7 +455,7 @@ User Request:
         action_screenshot.save(action_screenshot_path)
         execute_result: ActionExecuteResult = {
             "success": True,
-            "additional": await action.execute(cur_tab, self.tab_manager, self.storage),
+            "additional": await action.execute(cur_tab, self.tab_manager, None, self.memory),
         }
 
         result_screenshot = await tab_screenshot(cur_tab)
@@ -662,9 +650,9 @@ Based on the Task Description, construct appropriate Actions to move the task to
 {Action.get_format_prompt(include_types=None, exclude_types=[ActionType.Search])}
 
 ## Requirements
-You may construct one or more Actions. If multiple Actions are provided, they will be executed sequentially.
-All Actions MUST strictly follow the formats listed in Available Actions. Each Action must be output on its own line.
-Do NOT include explanations or any additional text.
+- You may construct one or more Actions. If multiple Actions are provided, they will be executed sequentially.
+- All Actions MUST strictly follow the formats listed in Available Actions. Each Action must be output on its own line.
+- Do NOT include explanations or any additional text.
 
 ## Task Description
 User Request: {self.user_request}
@@ -760,7 +748,7 @@ Nearest Next Objective: {next_objective}
                 # execute action
                 execute_result: ActionExecuteResult = {
                     "success": True,
-                    "additional": await action.execute(cur_tab, self.tab_manager, self.storage),
+                    "additional": await action.execute(cur_tab, self.tab_manager, tree, self.memory),
                 }
                 # update latest tab
                 cur_tab = self.tab_manager.front_tab

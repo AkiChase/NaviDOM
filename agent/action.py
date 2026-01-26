@@ -8,7 +8,7 @@ from agent.config import Config
 from agent.dom import DomNode
 from playwright.async_api import Page
 
-from agent.llm import ChatImageDetails
+from agent.llm import ChatTextDetails, SecondaryLLM
 from agent.utils import SpecialException, bing_search_url
 from agent.tab import TabManager
 
@@ -30,33 +30,24 @@ class ActionType(Enum):
     Search = "SEARCH"
     TabSwitch = "TAB_SWITCH"
     TabClose = "TAB_CLOSE"
-    SaveInfo = "SAVE_INFO"
-    # ExtractAndSaveInfo = "EXTRACT_AND_SAVE_INFO"
+    Memory = "MEMORY"
+    ExtractAndMemory = "EXTRACT_AND_MEMORY"
 
+
+all_action_types = list(ActionType)
 
 action_format_prompt = {
     ActionType.Click: "CLICK, <node_id>",
     ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// The target node must be editable (input or textarea). In <text>, only \\n has special meaning for line breaks; no other escaping is required",
-    ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>",
+    ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>. Minimum scroll increment is 0.1 pages",
     ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.Navigate: "NAVIGATE, <url>\t// Navigate to the specified URL",
     ActionType.Search: "SEARCH, <keywords>\t// Navigate to Bing search results for the given keywords",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to and activate the specified tab",
     ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
-    ActionType.SaveInfo: "SAVE_INFO, <content>\t// If the user request requires certain information to be output, store <content> (\\n for line breaks) using this action.",
-    # ActionType.ExtractAndSaveInfo: "EXTRACT_AND_SAVE_INFO, <subject>\t// The text in provided Interactive Nodes may be truncated with '...'. Use this action as an enhanced version of SAVE_INFO to extract content related to <subject> from the full text and store it.",
+    ActionType.Memory: "MEMORY, <content>\t// If the user request requires certain information to be output, explicitly record <content> (\\n for line breaks) using this action.",
+    ActionType.ExtractAndMemory: "EXTRACT_AND_MEMORY, <subject>\t// The text in provided Interactive Nodes may be omitted. Use this action as an enhanced but more expensive version of MEMORY to extract content related to <subject> from the full text and record it.",
 }
-
-all_action_types = [
-    ActionType.Click,
-    ActionType.Input,
-    ActionType.Scroll,
-    ActionType.Press,
-    ActionType.Navigate,
-    ActionType.Search,
-    ActionType.TabSwitch,
-    ActionType.TabClose,
-]
 
 
 class Action:
@@ -166,15 +157,20 @@ class Action:
             if tab_id not in tab_manager.tab_dict:
                 raise ActionParseException(f"Tab ID {tab_id} not found")
             return Action(uid, action_type, None, {"tab_id": tab_id})
-        elif action_type == ActionType.SaveInfo:
-            # SAVE_INFO, <content>
-            assert len(parts) == 2, ActionParseException(f"Invalid SAVE_INFO format: {raw_action}")
+        elif action_type == ActionType.Memory:
+            # MEMORY, <content>
+            assert len(parts) == 2, ActionParseException(f"Invalid MEMORY format: {raw_action}")
             content = parts[1].replace("\\n", "\n")
             return Action(uid, action_type, None, {"content": content})
+        elif action_type == ActionType.ExtractAndMemory:
+            # EXTRACT_AND_MEMORY, <subject>
+            assert len(parts) == 2, ActionParseException(f"Invalid EXTRACT_AND_MEMORY format: {raw_action}")
+            subject = parts[1]
+            return Action(uid, action_type, None, {"subject": subject})
         else:
             raise ActionParseException(f"Unsupported action type: {action_type}")
 
-    async def execute(self, tab: Page, tab_manager: "TabManager", storage: list[str]):
+    async def execute(self, tab: Page, tab_manager: "TabManager", dom: DomNode | None, memory: list[str]):
         # 简单实现
 
         if self.type in [ActionType.Click, ActionType.Input]:
@@ -197,7 +193,7 @@ class Action:
             # execute click/input action
             if self.type == ActionType.Click:
                 try:
-                    await loc.click(timeout=300, force=True)
+                    await loc.click(timeout=3000, force=True)
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
                 await asyncio.sleep(1.5)
@@ -206,9 +202,9 @@ class Action:
                 text = self.extra["text"]
                 try:
                     if clear:
-                        await loc.fill(text, timeout=300)
+                        await loc.fill(text, timeout=3000)
                     else:
-                        await loc.type(text, timeout=300)
+                        await loc.type(text, timeout=3000)
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
                 await asyncio.sleep(1.5)
@@ -251,16 +247,25 @@ class Action:
             tab = tab_manager.tab_dict[tab_id]
             await tab.close()
             await asyncio.sleep(0.5)
-        elif self.type == ActionType.SaveInfo:
+        elif self.type == ActionType.Memory:
             content = self.extra["content"]
-            storage.append(content)
+            memory.append(content)
+        elif self.type == ActionType.ExtractAndMemory:
+            if dom is None:
+                raise ActionExecuteException("DOM is None, cannot extract info")
+            subject = self.extra["subject"]
+            text_content = dom.convert_to_repr_node(skip_omit=True).get_human_tree_repr()
+            prompt = f"Extract the content strictly related to {subject} from the following HTML, ignoring HTML tags, and present it as a concise paragraph:\n{text_content}"
+            llm_detail = await SecondaryLLM.chat_with_text_detail(prompt)
+            memory.append(llm_detail["content"])
+            return llm_detail
         else:
             raise NotImplementedError(f"Action type {self.type} is not implemented")
 
 
 class ActionExecuteResult(TypedDict):
     success: bool
-    additional: ChatImageDetails | None | str  # Extract/Other/Error
+    additional: ChatTextDetails | None | str  # Extract/Other/Error
 
 
 @dataclass

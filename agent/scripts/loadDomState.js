@@ -56,7 +56,7 @@
                 height: actualRect.height,
                 isCovered,
             }
-            
+
             if (el.tagName.toLowerCase() === "iframe") {
                 const style = window.getComputedStyle(el);
                 const paddingLeft = parseFloat(style.paddingLeft);
@@ -121,7 +121,8 @@
                         bounds: null,
                         children,
                         text: el.textContent.trim(),
-                        index: null
+                        index: null,
+                        selector: null,
                     };
                     nodeMap.set(el, node);
                 } else {
@@ -136,6 +137,7 @@
                         children,
                         text: "",
                         index: getElementChildIndex(el),
+                        selector: CssSelectorGenerator.getCssSelector(el),
                     };
                     nodeMap.set(el, node);
                 }

@@ -106,6 +106,7 @@ class DomNode:
     parent: "DomNode | None"
     bounds: Bounds | IframeBounds | None
     is_covered: bool
+    selector: str | None
 
     @staticmethod
     async def from_raw(raw: dict[str, Any], start_local_id: int = 0) -> list["DomNode"]:
@@ -125,6 +126,7 @@ class DomNode:
             node.tag = raw_node["tag"]
             node.text = raw_node["text"]
             node.attributes = raw_node["attrs"]
+            node.selector = raw_node["selector"]
             if raw_node["bounds"]:
                 bounds_params = {
                     "x": raw_node["bounds"]["x"],
@@ -385,6 +387,10 @@ class DomNode:
 
     async def find_locator_in_frame(self, frame: Frame) -> Locator | None:
         # no search in sub-iframe
+        if self.selector is not None:
+            locator = frame.locator(self.selector)
+            if await locator.count() == 1:
+                return locator
 
         if len(self.children) == 1 and self.children[0].tag == "":
             locator = frame.get_by_text(text=self.children[0].text, exact=True)
@@ -411,8 +417,8 @@ class DomNode:
         else:
             return self._ancestor_set
 
-    def convert_to_repr_node(self, skip_filter=False, skip_promote=False, skip_conv_text=False) -> "ReprDomNode":
-        return ReprDomNode.from_dom_tree(self, skip_filter, skip_promote, skip_conv_text)
+    def convert_to_repr_node(self, skip_filter=False, skip_promote=False, skip_omit=False) -> "ReprDomNode":
+        return ReprDomNode.from_dom_tree(self, skip_filter, skip_promote, skip_omit)
 
     @staticmethod
     def extract_interactive_nodes(root: "DomNode") -> list["DomNode"]:
@@ -568,7 +574,7 @@ class ReprDomNode:
     parent: "ReprDomNode | None"
 
     @staticmethod
-    def from_dom_tree(root: DomNode, skip_filter=False, skip_promote=False, skip_conv_text=False) -> "ReprDomNode":
+    def from_dom_tree(root: DomNode, skip_filter=False, skip_promote=False, skip_omit=False) -> "ReprDomNode":
 
         # build repr dom tree
         def build_recur(node: DomNode, parent: "ReprDomNode | None"):
@@ -634,35 +640,38 @@ class ReprDomNode:
             for child in list(node.children):
                 promote_recur(child)
 
-
-
         # convert attributes
-        def conv_text_recur(node: ReprDomNode):
-
+        def omit_recur(node: ReprDomNode, skip_omit):
             node.repr_attributes = {}
-            node.repr_text = (
-                node.original_node.text[:100] + "..." if len(node.original_node.text) > 100 else node.original_node.text
-            )
+            if skip_omit:
+                node.repr_text = node.original_node.text
+            else:
+                node.repr_text = (
+                    node.original_node.text[:100] + "..."
+                    if len(node.original_node.text) > 100
+                    else node.original_node.text
+                )
             node.repr_attributes = {}
             for name, value in node.original_node.attributes.items():
                 if name in IMPORTANT_ATTRS or name.startswith("aria-"):
                     value = value.strip()
-                    if name == "class":
-                        value = " ".join(value.strip().split()[:2])
-                    elif len(value) > 15:
-                        value = value[:15] + "..."
+                    if not skip_omit:
+                        if name == "class":
+                            value = " ".join(value.split()[:2])
+                        elif len(value) > 20:
+                            value = value[:20] + "..."
                     node.repr_attributes[name] = value
 
             for child in node.children:
-                conv_text_recur(child)
+                omit_recur(child, skip_omit)
 
         repr_root = build_recur(root, None)
         if not skip_filter:
             filter_recur(repr_root)
         if not skip_promote:
             promote_recur(repr_root)
-        if not skip_conv_text:
-            conv_text_recur(repr_root)
+
+        omit_recur(repr_root, skip_omit)
         return repr_root
 
     def _get_tree_repr(self, indent: int = 0, no_end=False, no_id=False):

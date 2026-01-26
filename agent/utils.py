@@ -155,9 +155,16 @@ def format_time_delta(start: datetime | float, end: datetime | float, with_ms: b
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def format_seconds(seconds: float) -> str:
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def google_search_url(keywords: str) -> str:
     encoded = quote(keywords, safe="")
     return f"https://www.google.com/search?q={encoded}"
+
 
 def bing_search_url(keywords: str) -> str:
     encoded = quote(keywords, safe="")
