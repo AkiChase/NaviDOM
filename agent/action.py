@@ -31,6 +31,7 @@ class ActionType(Enum):
     Navigate = "NAVIGATE"
     Search = "SEARCH"
 
+
 all_action_types = list(ActionType)
 
 action_format_prompt = {
@@ -260,7 +261,8 @@ class Action:
 
 class ActionExecuteResult(TypedDict):
     success: bool
-    additional: ChatTextDetails | None | str  # Extract/Other/Error
+    result: None | str  # Other/Error
+    tab_changed_info: str | None
 
 
 @dataclass

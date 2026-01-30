@@ -103,6 +103,7 @@ class PrimaryLLM:
                     ],
                 }
             ],
+            "extra_body": {"enable_thinking": False},
             "temperature": cls.temperature,
             "stream": True,
             "stream_options": {
@@ -178,6 +179,7 @@ class PrimaryLLM:
                     ],
                 }
             ],
+            "extra_body": {"enable_thinking": False},
             "temperature": cls.temperature,
             "stream": True,
             "stream_options": {
@@ -256,6 +258,7 @@ class PrimaryLLM:
                     ],
                 }
             ],
+            "extra_body": {"enable_thinking": False},
             "temperature": cls.temperature,
             "stream": True,
             "stream_options": {

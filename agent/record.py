@@ -61,7 +61,7 @@ class PlanningRecord(Record):
 
 @dataclass
 class ExtractionRecord(Record):
-    llm_details: ChatImageDetails | None
+    llm_details: ChatImageDetails
     data: str
     time_line: TimeLine
 
@@ -79,7 +79,7 @@ class ExtractionRecord(Record):
 
 @dataclass
 class FeedbackRecord(Record):
-    llm_details: ChatImageDetails | None
+    llm_details: ChatTextDetails
     feedback: str
     time_line: TimeLine
 
@@ -100,7 +100,23 @@ class ActRecord(Record):
     action_details_list: list[ActionDetails]
     time_line: TimeLine
     llm_details: ChatImageDetails | ChatTextDetails
-    pruned_dom_repr: str
+    interactive_nodes_repr: str
+    act_goal: str
+
+    def get_actions_descriptions(self) -> str:
+        actions_info = []
+        for index, action_details in enumerate(self.action_details_list, 1):
+            if action_details.action is not None:
+                actions_info.append(f"{index}.")
+                actions_info.append(f"- Describe: {action_details.action.get_description()}")
+                success = action_details.execute_result["success"]
+                result = action_details.execute_result["result"]
+                tab_changed_info = action_details.execute_result["tab_changed_info"]
+                if not success and result is not None:
+                    actions_info.append(f"- Error: {result}")
+                if tab_changed_info is not None:
+                    actions_info.append(f"- Tab Changed: {tab_changed_info}")
+        return "\n".join(actions_info)
 
     def save(self, out_dir: Path):
         super().save(
@@ -110,7 +126,8 @@ class ActRecord(Record):
                 "action_details_list": [a.to_dict() for a in self.action_details_list],
                 "time_line": self.time_line.content,
                 "llm_details": self.llm_details,
-                "pruned_dom_repr": self.pruned_dom_repr,
+                "interactive_nodes_repr": self.interactive_nodes_repr,
+                "act_goal": self.act_goal,
             },
         )
 

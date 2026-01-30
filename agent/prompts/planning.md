@@ -25,16 +25,16 @@ The output should contain the following sections:
 - Example: Successfully opened the account settings page, enabling access to the user's profile details
 
 ### Requested Data Found
-- Indicate whether the UI now contains user-requested data according to the current UI Screenshot and Last Act Observation.
-- If found, state a clear and precise description of the data (the description will be used to extract concrete data from the full UI text and Image by Extraction Agent). Example: [FOUND] User's email address and account ID are visible in the profile section
-- If not found, use: [NOT_FOUND] data not found
+- Determine whether the current UI contains any newly discovered user-requested data that has not already been recorded in the Progress History, based on the current UI Screenshot and Last Act Observation.
+- If new data is found, provide a clear and precise description of the newly identified data (used by the Extraction Agent to extract concrete data from the full UI text and image). Example: [FOUND] Newly visible user's email address and account ID in the profile section
+- If not found, use: [NOT_FOUND] no new data compared to Progress History
 
 ### Task State
 - A one-sentence summary of the current overall task completion status, including what is still missing or unfinished. Example: The task is partially complete; the profile page has been accessed, but the user's subscription details are still missing.
 - If the task is fully complete, use: TASK_FULLY_FINISHED
 
 ### Act Goal
-- A one-sentence, UI-grounded goal describing the next step the Act Agent should take to achieve a clear objective. The goal must: State the purpose and actionable steps that are directly executable and sequentially feasible, including clicking elements, inputing text, pressing keys, scrolling the page, or switching/closing tabs. Example: Click the "Subscription" tab on the profile page to view the user's subscription details.
+- A one-sentence, UI-grounded goal describing the next step the Act Agent should take to achieve a clear objective. The goal must: State the purpose and actionable steps that are directly executable and sequentially feasible, including clicking elements, inputing text, pressing keys, scrolling the page, navigating to URL, or switching/closing tabs. Example: Click the "Subscription" tab on the profile page to view the user's subscription details.
 - If the task is fully complete, use: TASK_FULLY_FINISHED
 
 ## Output format

@@ -1,13 +1,11 @@
 import asyncio
 from datetime import datetime
 import itertools
-import json
 from pathlib import Path
 import re
-from typing import Awaitable, cast
 from loguru import logger
 from playwright.async_api import BrowserContext
-from PIL import ImageFont, ImageDraw, Image, ImageChops
+from PIL import ImageFont, ImageDraw, Image
 
 from agent.action import (
     Action,
@@ -20,11 +18,18 @@ from agent.action import (
 from agent.config import Config
 from agent.dom import DomCluster, DomNode, DomState
 from agent.llm import PrimaryLLM, SecondaryLLM
-from agent.record import ActRecord, ObservationRecord, PlanningRecord, Record, TimeLine
+from agent.record import (
+    ActRecord,
+    ExtractionRecord,
+    FeedbackRecord,
+    ObservationRecord,
+    PlanningRecord,
+    Record,
+    TimeLine,
+)
 from agent.tab import TabManager
 from agent.utils import (
     draw_text_label,
-    format_seconds,
     format_time_delta,
     gen_uid,
     load_default_font,
@@ -45,6 +50,8 @@ class Agent:
     last_planning_record: PlanningRecord | None
     last_act_record: ActRecord | None = None
     last_observation_record: ObservationRecord | None
+    last_extraction_record: ExtractionRecord | None
+    last_feedback_record: FeedbackRecord | None
     progress: list[str]
 
     def __init__(self, out_dir: Path, context: BrowserContext, user_request: str):
@@ -82,8 +89,7 @@ class Agent:
             await self.observation(before_act_screenshot, before_act_tabs_info)
 
         # 初次规划
-        extract_data_task = await self.planning()
-        # TODO 下一轮planning要等待extract_data_task完成
+        extraction_task = await self.planning()
 
         iteration_times = 0
         while True:
@@ -96,12 +102,16 @@ class Agent:
             # Observation
             await self.observation(before_act_screenshot, before_act_tabs_info)
             # Planning
-            await self.planning()
+            await extraction_task  # ensure extraction_task is done before planning
+            extraction_task = await self.planning()
 
             assert self.last_planning_record is not None
             if self.last_planning_record.task_completed:
-                # TODO 这里等待Extract（甚至其返回的Feedback）否则主动执行一次Feedback
-                # logger.success(f"[Planning] Task completed: {self.last_planning_record.current_state}")
+                # ensure extraction_task is done
+                feedback_task = await extraction_task
+                if feedback_task is not None:
+                    await feedback_task
+                logger.success(f"[Planning] Task completed")
                 break
 
             if iteration_times >= Config.max_iteration_times:
@@ -115,8 +125,8 @@ class Agent:
         logger.info(
             f"[Time] Per act time cost: {(end_time - start_time).total_seconds() / len([r for r in self.records if isinstance(r, ActRecord)]):.2f}s"
         )
-        out = self.save_result((end_time - start_time).total_seconds())
-        self.save_report(**out, out_dir=self.out_dir)
+        # out = self.save_result((end_time - start_time).total_seconds())
+        # self.save_report(**out, out_dir=self.out_dir)
 
     def parse_response(
         self,
@@ -137,17 +147,84 @@ class Agent:
         return fields
 
     async def feedback(self):
-        pass
-
-    async def extract(self, req_data_found: str) -> asyncio.Task:
-        # TODO 解析并视情况执行
-        # TODO 如果执行了记得再执行一个Feedback（无所谓结束时机）应该返回这个feedback相关的Task，任务结束可能需要等待
-        feed_back_task = asyncio.create_task(self.feedback())
-        return feed_back_task
-
-    async def planning(self):
         time_line = TimeLine()
-        record_index = len(self.records) + 1
+        record_index = len(self.records)
+        self.records.append(Record(record_index))
+        logger.info(f"[{record_index:03}] Feedback")
+
+        if self.last_feedback_record is None:
+            last_todo_list = "First time feedback, no previous TODO list."
+        else:
+            last_todo_list = self.last_feedback_record.feedback
+
+        if self.last_planning_record is None:
+            task_state = "No task state currently."
+        else:
+            task_state = self.last_planning_record.task_state
+
+        prompt = self.prompts_dict["feedback"].format(
+            user_request=self.user_request,
+            last_todo_list=last_todo_list,
+            agent_history=self.get_formated_progress_history(),
+            task_state=task_state,
+        )
+        llm_detail = await SecondaryLLM.chat_with_text_detail(prompt)
+        content = llm_detail["content"]
+        time_line.add("llm")
+
+        record = FeedbackRecord(
+            index=record_index,
+            llm_details=llm_detail,
+            feedback=content,
+            time_line=time_line,
+        )
+        self.records[record_index] = record
+
+    async def extraction(self, new_progress: str, req_data_found: str) -> asyncio.Task[None] | None:
+        if req_data_found.find("[FOUND]") != -1:
+            time_line = TimeLine()
+            record_index = len(self.records)
+            self.records.append(Record(record_index))
+            logger.info(f"[{record_index:03}] Extraction")
+
+            cur_tab = self.tab_manager.front_tab
+
+            dom_state = await DomState.load_dom_state(cur_tab)
+            dom_repr = dom_state.dom.convert_to_repr_node(skip_omit=True)
+            screenshot = await tab_screenshot(cur_tab)
+            time_line.add("fetch")
+
+            prompt = self.prompts_dict["extraction"].format(
+                last_progress=new_progress,
+                last_requested_data_found=req_data_found,
+                html=dom_repr,
+            )
+            llm_detail = await SecondaryLLM.chat_with_image_detail(prompt, screenshot)
+            time_line.add("llm")
+
+            content = llm_detail["content"]
+            self.progress.append(content)
+            record = ExtractionRecord(
+                index=record_index,
+                llm_details=llm_detail,
+                data=content,
+                time_line=time_line,
+            )
+            self.records[record_index] = record
+
+            feed_back_task = asyncio.create_task(self.feedback())
+            return feed_back_task
+        elif req_data_found.find("[NOT_FOUND]") != -1:
+            logger.debug(f"[Extraction] No new data")
+        else:
+            logger.error(f"[Extraction] Invalid Requested Data Found format: {req_data_found}")
+        return None
+
+    async def planning(self) -> asyncio.Task[asyncio.Task[None] | None]:
+        time_line = TimeLine()
+        record_index = len(self.records)
+        self.records.append(Record(record_index))
+        record_prefix = f"{record_index:03}_planning"
         logger.info(f"[{record_index:03}] Planning")
 
         if self.last_planning_record is None:
@@ -160,16 +237,7 @@ class Agent:
         if self.last_act_record is None:
             last_act = "Navigate to the initial page (See Current Tabs for details)."
         else:
-            last_act = []
-            for index, d in enumerate(self.last_act_record.action_details_list, 1):
-                if d.execute_result["success"]:
-                    assert d.action is not None
-                    last_act.append(f"{index}. {d.action.get_description()}")
-                else:
-                    last_act.append(
-                        f"{index}. Failed to execute {d.raw_action}, reason: {d.execute_result['additional']}"
-                    )
-            last_act = "\n".join(last_act)
+            last_act = self.last_act_record.get_actions_descriptions()
 
         if self.last_observation_record is None:
             last_act_observation = "The first Planning. No Last Act Observation."
@@ -177,7 +245,6 @@ class Agent:
             last_act_observation = self.last_observation_record.observation
 
         cur_tab = self.tab_manager.front_tab
-        screenshot = await tab_screenshot(cur_tab)
 
         screenshot = await tab_screenshot(cur_tab)
         time_line.add("fetch")
@@ -189,7 +256,7 @@ class Agent:
             last_act_goal=last_act_goal,
             last_act=last_act,
             last_act_observation=last_act_observation,
-            current_tabs=self.tab_manager.get_tabs_info(),
+            current_tabs=await self.tab_manager.get_tabs_info(),
         )
 
         new_progress_pattern = re.compile(r"<New Progress>(.*?)</New Progress>", re.DOTALL)
@@ -197,18 +264,26 @@ class Agent:
         task_state_pattern = re.compile(r"<Task State>(.*?)</Task State>", re.DOTALL)
         act_goal_pattern = re.compile(r"<Act Goal>(.*?)</Act Goal>", re.DOTALL)
 
-        extract_data_task = None
+        extraction_task = None
 
-        async def hook_extract_and_feedback(content: str):
-            nonlocal extract_data_task
-            if extract_data_task is not None:
+        async def hook_extraction_and_feedback(content: str):
+            nonlocal extraction_task
+            if extraction_task is not None:
                 return
-            requested_data_found = self.parse_response(content, [requested_data_found_pattern])[0]
-            if requested_data_found is None:
+            new_progress, requested_data_found = self.parse_response(
+                content, [new_progress_pattern, requested_data_found_pattern]
+            )
+            if new_progress is None or requested_data_found is None:
                 return
-            extract_data_task = asyncio.create_task(self.extract(requested_data_found))
+            extraction_task = asyncio.create_task(self.extraction(new_progress, requested_data_found))
 
-        llm_details = await PrimaryLLM.chat_with_image_detail(prompt, screenshot, hook=hook_extract_and_feedback)
+        final_screenshot = screenshot.resize(
+            (int(screenshot.width * 0.75), int(screenshot.height * 0.75)), resample=Image.Resampling.LANCZOS
+        )
+        final_screenshot.save(self.out_dir / f"{record_prefix}.jpg")
+        llm_details = await PrimaryLLM.chat_with_image_detail(
+            prompt, final_screenshot, hook=hook_extraction_and_feedback
+        )
         time_line.add("llm")
 
         content = llm_details["content"]
@@ -239,77 +314,38 @@ class Agent:
             time_line=time_line,
         )
         record.save(self.out_dir)
-        self.records.append(record)
+        self.records[record_index] = record
         self.last_planning_record = record
 
-        assert isinstance(extract_data_task, asyncio.Task), "Failed to create extract data task"
-        return extract_data_task
+        assert isinstance(extraction_task, asyncio.Task), "Failed to create extraction data task"
+        return extraction_task
 
     async def observation(self, before_act_screenshot: Image.Image, before_act_tabs_info: str):
-        cur_tab = self.tab_manager.front_tab
-
         time_line = TimeLine()
-        record_index = len(self.records) + 1
-
+        record_index = len(self.records)
+        self.records.append(Record(record_index))
         assert self.last_act_record is not None
+        logger.info(f"[{record_index:03}] Observation")
 
-        after_act_screenshot = await tab_screenshot(cur_tab)
-        after_act_tabs_info = await self.tab_manager.get_tabs_info()
-        tab_changed = before_act_tabs_info != after_act_tabs_info
-        ui_changed = ImageChops.difference(before_act_screenshot, after_act_screenshot).getbbox() is not None
-        if tab_changed or ui_changed:
-            logger.info(f"[{record_index:03}] Observation")
-            success_action_descriptions = [
-                d.action.get_description()
-                for d in self.last_act_record.action_details_list
-                if d.execute_result["success"] and d.action is not None
-            ]
-            if success_action_descriptions:
-                actions_info = "\n".join([f"{index}. {d}" for index, d in enumerate(success_action_descriptions, 1)])
-            else:
-                actions_info = "No actions."
+        after_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
+        actions_info = self.last_act_record.get_actions_descriptions()
 
-            if Config.debug:
-                record_prefix = f"{record_index:03}_observation"
-                before_act_screenshot.save(self.out_dir / f"{record_prefix}_debug_before.jpg")
-                after_act_screenshot.save(self.out_dir / f"{record_prefix}_debug_after.jpg")
+        if Config.debug:
+            record_prefix = f"{record_index:03}_observation"
+            before_act_screenshot.save(self.out_dir / f"{record_prefix}_debug_before.jpg")
+            after_act_screenshot.save(self.out_dir / f"{record_prefix}_debug_after.jpg")
 
-            time_line.add("fetch")
-            prompt = f"""
-You are an assistant with strong visual analysis skills.
-You are given:
-- Screenshot 1: previous active tab page BEFORE the actions
-- Screenshot 2: current active tab page AFTER the actions
-- Browser tabs information before the actions:
-{before_act_tabs_info}
-- Browser tabs information after the actions:
-{after_act_tabs_info}
-- A brief description of the actions that were performed:
-{actions_info}
-
-Based only on what you see, write one concise paragraph that:
-- Describes the main visual differences between the two screenshots (what appeared, disappeared, moved, or changed state, e.g., dropdowns, modals, buttons).
-- If there are noticeable changes in the browser tab information between the two states, include them; otherwise, do not mention them.
-- Explains, at a high level, what result is reflected on the tab page and what the user can do on current active tab page.
-
-Important constraints:
-- Do NOT infer user intent or speculate on why the actions were taken.
-- Do NOT restate or interpret the actions themselves.
-- Use the action description only as background context to better understand the visual transition, not as evidence.
-- Focus strictly on observable UI changes and the resulting tab page state.
-- Keep the response compact and tightly written in a single paragraph
-            """.strip()
-            llm_details = await SecondaryLLM.chat_with_image_list_detail(
-                prompt, [before_act_screenshot, after_act_screenshot]
-            )
-            observation = llm_details["content"]
-            logger.debug(f"[Result] {llm_details['content']}")
-            time_line.add("llm")
-        else:
-            observation = f"Browser tabs and UI page not changed"
-            logger.debug(f"[Result] {observation}")
-            llm_details = None
-            time_line.add("fetch")
+        time_line.add("fetch")
+        prompt = self.prompts_dict["observation"].format(
+            act_goal=self.last_act_record.act_goal,
+            action_execution_description=actions_info,
+        )
+        llm_details = await SecondaryLLM.chat_with_image_list_detail(
+            prompt, [before_act_screenshot, after_act_screenshot]
+        )
+        observation = llm_details["content"]
+        logger.debug(f"[Result] {llm_details['content']}")
+        time_line.add("llm")
 
         time_line.add("end")
         record = ObservationRecord(
@@ -319,7 +355,7 @@ Important constraints:
             time_line=time_line,
         )
         record.save(self.out_dir)
-        self.records.append(record)
+        self.records[record_index] = record
         self.last_observation_record = record
 
     async def act_initial(self):
@@ -343,14 +379,15 @@ User Request:
         """.strip()
 
         time_line = TimeLine()
-        record_index = len(self.records) + 1
+        record_index = len(self.records)
+        self.records.append(Record(record_index))
         action_index = 1
         action_uid = gen_uid()
         record_prefix = f"{record_index:03}_act"
         action_prefix = f"{record_prefix}_{action_index:03}_{action_uid}"
         logger.info(f"[{record_index:03}] Act")
 
-        llm_details = await PrimaryLLM.chat_with_text_detail(prompt)
+        llm_details = await SecondaryLLM.chat_with_text_detail(prompt)
         time_line.add("llm")
         raw_action = llm_details["content"]
         action = Action.from_raw_action(
@@ -363,9 +400,13 @@ User Request:
         draw_text_label(action_screenshot_draw, text=action.type.name, position=(10, 10), font=self.font_18)
         action_screenshot_path = self.out_dir / f"{action_prefix}_action.jpg"
         action_screenshot.save(action_screenshot_path)
+        old_tab_info = await self.tab_manager.get_cur_tab_info()
+        action_result = await action.execute(cur_tab, self.tab_manager)
+        new_tab_info = await self.tab_manager.get_cur_tab_info()
         execute_result: ActionExecuteResult = {
             "success": True,
-            "additional": await action.execute(cur_tab, self.tab_manager),
+            "result": action_result,
+            "tab_changed_info": self.tab_manager.compare_tab_info(new_tab_info, old_tab_info),
         }
 
         result_screenshot = await tab_screenshot(cur_tab)
@@ -385,14 +426,16 @@ User Request:
             action_details_list=[action_details],
             time_line=time_line,
             llm_details=llm_details,
-            pruned_dom_repr="",
+            interactive_nodes_repr="",
+            act_goal="Navigate to the initial tab page.",
         )
         record.save(self.out_dir)
-        self.records.append(record)
+        self.records[record_index] = record
         self.last_act_record = record
 
     async def act(self):
-        record_index = len(self.records) + 1
+        record_index = len(self.records)
+        self.records.append(Record(record_index))
         record_prefix = f"{record_index:03}_act"
         cur_tab = self.tab_manager.front_tab
         time_line = TimeLine()
@@ -405,7 +448,6 @@ User Request:
         dom_state = await DomState.load_dom_state(cur_tab)
         screenshot = await tab_screenshot(cur_tab)
         dom = dom_state.dom
-        viewport = dom_state.viewport
         time_line.add("fetch")
 
         if Config.debug:
@@ -474,108 +516,69 @@ User Request:
             cluster_screenshot.save(self.out_dir / f"{record_prefix}_debug_3_cluster_all.jpg")
             time_line.add("_debug")
 
-        fallback = False
-        final_nodes = interactive_nodes
-        if len(clusters) == 1:
-            fallback = True
-        else:
-            # 基于LLM过滤与任务不相关的聚类区域
-            related_tasks = []
-            related_rects = []
-            for index, cluster in enumerate(clusters):
-                rect = DomCluster.cluster_covered_xyxy(cluster)
-                related_rects.append(rect)
-                cluster_region = screenshot.crop(rect)
-                cluster_region_draw = ImageDraw.Draw(cluster_region)
-                for node in cluster:
-                    node_bounds = node.max_bounds()
-                    if node_bounds is None:
-                        continue
-                    node_bounds = node_bounds.to_xyxy()
-                    node_bounds = (
-                        node_bounds[0] - rect[0],
-                        node_bounds[1] - rect[1],
-                        node_bounds[2] - rect[0],
-                        node_bounds[3] - rect[1],
-                    )
-                    cluster_region_draw.rectangle(node_bounds, outline="red", width=2)
-                if Config.debug:
-                    cluster_region.save(self.out_dir / f"{record_prefix}_debug_4_cluster_{index + 1}.jpg")
-                related_tasks.append(DomCluster.determine_cluster_related(cluster, cluster_region, task=act_goal))
-            related_tasks_res = await asyncio.gather(*related_tasks)
-            related_cluster = [
-                (cluster, rect) for (flag, _), cluster, rect in zip(related_tasks_res, clusters, related_rects) if flag
-            ]
-            flags = [flag for flag, _ in related_tasks_res]
-            logger.debug(
-                f"[Pruning] Related {len(related_cluster)}, unrelated {len(flags) - len(related_cluster)}: {str(flags)}"
-            )
-
-            if not related_cluster:
-                logger.warning("[Pruning] All unrelated, fallback to no pruning")
-                fallback = True
-                # TODO 这里需要特殊处理，不要再fallback了，应该是在prompt中提示无相关Node然后available_actions中不包含Click之类Action
-            else:
-                # 合并边界存在重叠的区域，用于构建紧凑的UI图
-                merged_rects = DomCluster.cluster_merge_overlapped(related_cluster)
-                # 构建压缩后的UI图像
-                final_screenshot = DomCluster.cluster_image_layout_compaction(screenshot, merged_rects, default_gap=1)
-                final_nodes: list[DomNode] = list(
-                    itertools.chain.from_iterable(cluster for cluster, _ in related_cluster)
+        # 基于LLM过滤与任务不相关的聚类区域
+        related_tasks = []
+        related_rects = []
+        for index, cluster in enumerate(clusters):
+            rect = DomCluster.cluster_covered_xyxy(cluster)
+            related_rects.append(rect)
+            cluster_region = screenshot.crop(rect)
+            cluster_region_draw = ImageDraw.Draw(cluster_region)
+            for node in cluster:
+                node_bounds = node.max_bounds()
+                if node_bounds is None:
+                    continue
+                node_bounds = node_bounds.to_xyxy()
+                node_bounds = (
+                    node_bounds[0] - rect[0],
+                    node_bounds[1] - rect[1],
+                    node_bounds[2] - rect[0],
+                    node_bounds[3] - rect[1],
                 )
-
-        # 去除fallback
-        if fallback:
-            # 回退到无语义剪枝
-            final_screenshot = screenshot.copy()
-            final_nodes = interactive_nodes
-            final_screenshot_draw = ImageDraw.Draw(final_screenshot)
-            for node in final_nodes:
-                node.draw_bounds(
-                    final_screenshot_draw,
-                    outline="red",
-                    width=1,
-                    draw_id=False,
-                    recursive=False,
-                    max_bounds=True,
-                )
-        if Config.debug:
-            final_screenshot.save(self.out_dir / f"{record_prefix}_debug_5_final.jpg")
-
-        pruned_dom_repr = "\n\n".join(
-            [node.convert_to_repr_node().get_human_tree_repr(no_end=True) for node in final_nodes]
+                cluster_region_draw.rectangle(node_bounds, outline="red", width=2)
+            if Config.debug:
+                cluster_region.save(self.out_dir / f"{record_prefix}_debug_4_cluster_{index + 1}.jpg")
+            related_tasks.append(DomCluster.determine_cluster_related(cluster, cluster_region, task=act_goal))
+        related_tasks_res = await asyncio.gather(*related_tasks)
+        related_cluster = [
+            (cluster, rect) for (flag, _), cluster, rect in zip(related_tasks_res, clusters, related_rects) if flag
+        ]
+        flags = [flag for flag, _ in related_tasks_res]
+        logger.debug(
+            f"[Pruning] Related {len(related_cluster)}, unrelated {len(flags) - len(related_cluster)}: {str(flags)}"
         )
+
+        if not related_cluster:
+            final_screenshot = screenshot.resize(
+                (int(screenshot.width * 0.75), int(screenshot.height * 0.75)), resample=Image.Resampling.LANCZOS
+            )
+            final_nodes = []
+            interactive_nodes_repr = "No act goal related interactive nodes."
+            available_actions = Action.get_format_prompt(
+                exclude_types=[ActionType.Click, ActionType.Input, ActionType.Search]
+            )
+        else:
+            # 合并边界存在重叠的区域，用于构建紧凑的UI图
+            merged_rects = DomCluster.cluster_merge_overlapped(related_cluster)
+            # 构建压缩后的UI图像
+            final_screenshot = DomCluster.cluster_image_layout_compaction(screenshot, merged_rects, default_gap=1)
+            final_nodes: list[DomNode] = list(itertools.chain.from_iterable(cluster for cluster, _ in related_cluster))
+            if Config.debug:
+                final_screenshot.save(self.out_dir / f"{record_prefix}_debug_5_final.jpg")
+            interactive_nodes_repr = "\n\n".join(
+                [node.convert_to_repr_node().get_human_tree_repr(no_end=True) for node in final_nodes]
+            )
+            available_actions = Action.get_format_prompt(exclude_types=[ActionType.Search])
         time_line.add("pruning")
 
-        prompt = f"""
-You are a web AI agent designed to operate in an iterative loop to automate browser tasks.
-The User Request represents the overall task objective and must always guide your decisions.
-The Current State and Nearest Next Objective are the planning results of the last iteration.
-Based on the Task Description, construct appropriate Actions to move the task toward the nearest next objective.
-
-## Available Actions
-{Action.get_format_prompt(include_types=None, exclude_types=[ActionType.Search])}
-
-## Requirements
-- You may construct one or more Actions. If multiple Actions are provided, they will be executed sequentially.
-- All Actions MUST strictly follow the formats listed in Available Actions. Each Action must be output on its own line.
-- Do NOT include explanations or any additional text.
-
-## Task Description
-User Request: {self.user_request}
-Current State: {task_state}
-{action_reflection}
-Nearest Next Objective: {act_goal}
-
-## Browser Tabs
-{await self.tab_manager.get_tabs_info()}
-
-## Current Tab
-- {self.tab_manager.get_tab_id_info()}
-- {viewport.get_viewport_scroll_info()}
-- Interactive Nodes. Each element is prefixed with a unique [node_id]. If action contains target node, it must be one of the following:
-{pruned_dom_repr}
-""".strip()
+        prompt = self.prompts_dict["act"].format(
+            available_actions=available_actions,
+            user_request=self.user_request,
+            task_state=task_state,
+            act_goal=act_goal,
+            current_tabs=await self.tab_manager.get_tabs_info(),
+            interactive_nodes=interactive_nodes_repr,
+        )
 
         llm_action_detail = await PrimaryLLM.chat_with_image_detail(prompt, final_screenshot)
         time_line.add("llm")
@@ -586,43 +589,8 @@ Nearest Next Objective: {act_goal}
         raw_action_types = [raw_action.split(",", maxsplit=1)[0].strip() for raw_action in raw_action_list]
         logger.debug(f"[Action] Generate {len(raw_action_list)} actions: [{', '.join(raw_action_types)}]")
 
-        old_tab_id = self.tab_manager.cur_tab_id
+        old_tab_info = await self.tab_manager.get_cur_tab_info()
         for action_index, raw_action in enumerate(raw_action_list, 1):
-            # tab changed, skip rest actions
-            tab_changed = self.tab_manager.cur_tab_id != old_tab_id
-            last_action_failed = (
-                False if not action_details_list else action_details_list[-1].execute_result["success"] == False
-            )
-
-            if tab_changed or last_action_failed:
-                rest_raw_action_list = raw_action_list[action_index - 1 :]
-                error_reason = "Tab changed" if tab_changed else "Last action failed"
-                error_msg = f"{error_reason}, stop executing the remaining actions"
-                logger.debug(
-                    f"[Action] {error_reason}, stop executing the remaining {len(rest_raw_action_list)} actions"
-                )
-                action_screenshot = await tab_screenshot(cur_tab)
-                draw_text_label(action_screenshot_draw, text=error_msg, position=(10, 40), font=self.font_18)
-                result_screenshot_path = action_screenshot_path = (
-                    self.out_dir
-                    / f"{record_prefix}_{action_index:03}-{action_index+len(rest_raw_action_list)-1:03}_error.jpg"
-                )
-                action_screenshot.save(action_screenshot_path)
-                for rest_raw_action in rest_raw_action_list:
-                    action_details_list.append(
-                        ActionDetails(
-                            raw_action=rest_raw_action,
-                            execute_result={
-                                "success": False,
-                                "additional": error_msg,
-                            },
-                            action=None,
-                            action_screenshot_path=action_screenshot_path,
-                            result_screenshot_path=result_screenshot_path,
-                        )
-                    )
-                break
-
             action_uid = gen_uid()
             action_prefix = f"{record_prefix}_{action_index:03}_{action_uid}"
             logger.debug(f"[Action] {action_index}. {raw_action}")
@@ -634,6 +602,8 @@ Nearest Next Objective: {act_goal}
                 position=(10, 10),
                 font=self.font_18,
             )
+            action_screenshot_path = self.out_dir / f"{action_prefix}_action.jpg"
+            action_screenshot.save(action_screenshot_path)
             try:
                 # parse action
                 action = Action.from_raw_action(
@@ -649,44 +619,43 @@ Nearest Next Objective: {act_goal}
                         recursive=False,
                         max_bounds=True,
                     )
-                action_screenshot_path = self.out_dir / f"{action_prefix}_action.jpg"
-                action_screenshot.save(action_screenshot_path)
-
+                action_screenshot.save(action_screenshot_path)  # overwrite
                 # execute action
-                execute_result: ActionExecuteResult = {
-                    "success": True,
-                    "additional": await action.execute(cur_tab, self.tab_manager),
-                }
-                # update latest tab
-                cur_tab = self.tab_manager.front_tab
-                result_screenshot = await tab_screenshot(cur_tab)
-                result_screenshot_path = self.out_dir / f"{action_prefix}_result.jpg"
-                result_screenshot.save(result_screenshot_path)
+                action_result = await action.execute(cur_tab, self.tab_manager)
+                action_error = None
             except ActionParseException as e:
                 logger.warning(f"[Act] Parse action failed, {e}. Action: {raw_action}")
-                draw_text_label(action_screenshot_draw, text=str(e), position=(10, 40), font=self.font_18)
-                action_screenshot_path = self.out_dir / f"{action_prefix}_error.jpg"
-                action_screenshot.save(action_screenshot_path)
-                result_screenshot_path = action_screenshot_path  # the same
-                execute_result: ActionExecuteResult = {
-                    "success": False,
-                    "additional": str(e),
-                }
+                action_result = str(e)
+                action_error = e
                 action = None
             except ActionExecuteException as e:
                 assert action is not None
                 logger.warning(f"[Act] Execute {action.type.value} action failed: {e}")
-                execute_result: ActionExecuteResult = {
-                    "success": False,
-                    "additional": str(e),
-                }
-                # update latest tab
-                cur_tab = self.tab_manager.front_tab
+                action_result = str(e)
+                action_error = e
 
-                result_screenshot = await tab_screenshot(cur_tab)
+            # update latest tab
+            cur_tab = self.tab_manager.front_tab
+            new_tab_info = await self.tab_manager.get_cur_tab_info()
+            tab_id_changed = new_tab_info["tab_id"] != old_tab_info["tab_id"]
+            tab_changed_info = self.tab_manager.compare_tab_info(new_tab_info, old_tab_info)
+            old_tab_info = new_tab_info
+
+            # save result info
+            action_success = action_error is None
+            result_screenshot = await tab_screenshot(cur_tab)
+            if action_success:
+                result_screenshot_path = self.out_dir / f"{action_prefix}_result.jpg"
+            else:
                 result_screenshot_path = self.out_dir / f"{action_prefix}_error.jpg"
-                result_screenshot.save(result_screenshot_path)
-
+                result_screenshot_draw = ImageDraw.Draw(result_screenshot)
+                draw_text_label(result_screenshot_draw, text=str(action_error), position=(10, 10), font=self.font_18)
+            result_screenshot.save(result_screenshot_path)
+            execute_result: ActionExecuteResult = {
+                "success": action_success,
+                "result": action_result,
+                "tab_changed_info": tab_changed_info,
+            }
             action_details_list.append(
                 ActionDetails(
                     raw_action=raw_action,
@@ -698,282 +667,309 @@ Nearest Next Objective: {act_goal}
             )
             time_line.add(f"execute_{action_index:03}")
 
+            if tab_id_changed or not action_success:
+                rest_raw_action_list = raw_action_list[action_index:]
+                error_reason = "Tab id changed" if tab_id_changed else "Last action failed"
+                error_msg = f"{error_reason}, stop executing the remaining actions"
+                logger.debug(
+                    f"[Action] {error_reason}, stop executing the remaining {len(rest_raw_action_list)} actions"
+                )
+                action_screenshot = await tab_screenshot(cur_tab)
+                draw_text_label(action_screenshot_draw, text=error_msg, position=(10, 40), font=self.font_18)
+                result_screenshot_path = action_screenshot_path = (
+                    self.out_dir
+                    / f"{record_prefix}_{action_index:03}-{action_index+len(rest_raw_action_list)-1:03}_error.jpg"
+                )
+                action_screenshot.save(action_screenshot_path)
+                for rest_raw_action in rest_raw_action_list:
+                    action_details_list.append(
+                        ActionDetails(
+                            raw_action=rest_raw_action,
+                            execute_result={"success": False, "result": error_msg, "tab_changed_info": None},
+                            action=None,
+                            action_screenshot_path=action_screenshot_path,
+                            result_screenshot_path=result_screenshot_path,
+                        )
+                    )
+                break
+
         record = ActRecord(
             index=record_index,
             action_details_list=action_details_list,
             time_line=time_line,
-            pruned_dom_repr=pruned_dom_repr,
+            interactive_nodes_repr=interactive_nodes_repr,
             llm_details=llm_action_detail,
+            act_goal=act_goal,
         )
         record.save(self.out_dir)
-        self.records.append(record)
+        self.records[record_index] = record
         self.last_act_record = record
 
-    def save_result(self, total_time_cost: float):
-        user_request = self.user_request
-        token = PrimaryLLM.token_dict
-        for k, v in SecondaryLLM.token_dict.items():
-            if k not in token:
-                token[k] = v
-            else:
-                token[k]["completion_tokens"] += v["completion_tokens"]
-                token[k]["prompt_tokens"] += v["prompt_tokens"]
-                token[k]["total_tokens"] += v["total_tokens"]
+    # def save_result(self, total_time_cost: float):
+    #     user_request = self.user_request
+    #     token = PrimaryLLM.token_dict
+    #     for k, v in SecondaryLLM.token_dict.items():
+    #         if k not in token:
+    #             token[k] = v
+    #         else:
+    #             token[k]["completion_tokens"] += v["completion_tokens"]
+    #             token[k]["prompt_tokens"] += v["prompt_tokens"]
+    #             token[k]["total_tokens"] += v["total_tokens"]
 
-        success = self.last_planning_record is not None and self.last_planning_record.task_completed
-        if success:
-            assert self.last_planning_record is not None
-            result = self.last_planning_record.current_state
-        else:
-            result = "Task failed."
+    #     success = self.last_planning_record is not None and self.last_planning_record.task_completed
+    #     if success:
+    #         assert self.last_planning_record is not None
+    #         result = self.last_planning_record.current_state
+    #     else:
+    #         result = "Task failed."
 
-        records = []
-        for record in self.records:
-            if isinstance(record, ActRecord):
-                prompt_tokens = record.llm_details["prompt_tokens"]
-                completion_tokens = record.llm_details["completion_tokens"]
-                for d in record.action_details_list:
-                    additional = d.execute_result["additional"]
-                    if (
-                        isinstance(additional, dict)
-                        and "prompt_tokens" in additional
-                        and "completion_tokens" in additional
-                    ):
-                        prompt_tokens += additional["prompt_tokens"]
-                        completion_tokens += additional["completion_tokens"]
+    #     records = []
+    #     for record in self.records:
+    #         if isinstance(record, ActRecord):
+    #             prompt_tokens = record.llm_details["prompt_tokens"]
+    #             completion_tokens = record.llm_details["completion_tokens"]
+    #             for d in record.action_details_list:
+    #                 additional = d.execute_result["additional"]
+    #                 if (
+    #                     isinstance(additional, dict)
+    #                     and "prompt_tokens" in additional
+    #                     and "completion_tokens" in additional
+    #                 ):
+    #                     prompt_tokens += additional["prompt_tokens"]
+    #                     completion_tokens += additional["completion_tokens"]
 
-                records.append(
-                    {
-                        "type": "act",
-                        "actions": [
-                            {
-                                "raw": d.raw_action,
-                                "description": d.action.get_description() if d.action is not None else "Parse Failed",
-                                "success": d.execute_result["success"],
-                                "action_screenshot_name": d.action_screenshot_path.name,
-                                "result_screenshot_name": d.result_screenshot_path.name,
-                                "additional": (
-                                    d.execute_result["additional"]["content"]
-                                    if isinstance(d.execute_result["additional"], dict)
-                                    else d.execute_result["additional"]
-                                ),
-                            }
-                            for d in record.action_details_list
-                        ],
-                        "token_usage": {
-                            "prompt_tokens": prompt_tokens,
-                            "completion_tokens": completion_tokens,
-                        },
-                        "time_cost": round(record.time_line.total_time(), 4),
-                    }
-                )
-            elif isinstance(record, ObservationRecord):
-                token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-                if record.llm_details is not None:
-                    token_usage["prompt_tokens"] = record.llm_details["prompt_tokens"]
-                    token_usage["completion_tokens"] = record.llm_details["completion_tokens"]
+    #             records.append(
+    #                 {
+    #                     "type": "act",
+    #                     "actions": [
+    #                         {
+    #                             "raw": d.raw_action,
+    #                             "description": d.action.get_description() if d.action is not None else "Parse Failed",
+    #                             "success": d.execute_result["success"],
+    #                             "action_screenshot_name": d.action_screenshot_path.name,
+    #                             "result_screenshot_name": d.result_screenshot_path.name,
+    #                             "additional": (
+    #                                 d.execute_result["additional"]["content"]
+    #                                 if isinstance(d.execute_result["additional"], dict)
+    #                                 else d.execute_result["additional"]
+    #                             ),
+    #                         }
+    #                         for d in record.action_details_list
+    #                     ],
+    #                     "token_usage": {
+    #                         "prompt_tokens": prompt_tokens,
+    #                         "completion_tokens": completion_tokens,
+    #                     },
+    #                     "time_cost": round(record.time_line.total_time(), 4),
+    #                 }
+    #             )
+    #         elif isinstance(record, ObservationRecord):
+    #             token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    #             if record.llm_details is not None:
+    #                 token_usage["prompt_tokens"] = record.llm_details["prompt_tokens"]
+    #                 token_usage["completion_tokens"] = record.llm_details["completion_tokens"]
 
-                records.append(
-                    {
-                        "type": "observation",
-                        "observation": record.observation,
-                        "time_cost": round(record.time_line.total_time(), 4),
-                        "token_usage": token_usage,
-                    }
-                )
-            elif isinstance(record, PlanningRecord):
-                if record.task_completed:
-                    records.append(
-                        {
-                            "type": "planning",
-                            "task_completed": record.task_completed,
-                            "task_result": record.current_state,
-                            "time_cost": round(record.time_line.total_time(), 4),
-                            "token_usage": {
-                                "prompt_tokens": record.llm_details["prompt_tokens"],
-                                "completion_tokens": record.llm_details["completion_tokens"],
-                            },
-                        }
-                    )
-                else:
-                    records.append(
-                        {
-                            "type": "planning",
-                            "current_state": record.current_state,
-                            "nearest_next_objective": record.nearest_next_objective,
-                            "unfinished_content": record.unfinished_content,
-                            "task_completed": record.task_completed,
-                            "time_cost": round(record.time_line.total_time(), 4),
-                            "token_usage": {
-                                "prompt_tokens": record.llm_details["prompt_tokens"],
-                                "completion_tokens": record.llm_details["completion_tokens"],
-                            },
-                        }
-                    )
+    #             records.append(
+    #                 {
+    #                     "type": "observation",
+    #                     "observation": record.observation,
+    #                     "time_cost": round(record.time_line.total_time(), 4),
+    #                     "token_usage": token_usage,
+    #                 }
+    #             )
+    #         elif isinstance(record, PlanningRecord):
+    #             if record.task_completed:
+    #                 records.append(
+    #                     {
+    #                         "type": "planning",
+    #                         "task_completed": record.task_completed,
+    #                         "task_result": record.current_state,
+    #                         "time_cost": round(record.time_line.total_time(), 4),
+    #                         "token_usage": {
+    #                             "prompt_tokens": record.llm_details["prompt_tokens"],
+    #                             "completion_tokens": record.llm_details["completion_tokens"],
+    #                         },
+    #                     }
+    #                 )
+    #             else:
+    #                 records.append(
+    #                     {
+    #                         "type": "planning",
+    #                         "current_state": record.current_state,
+    #                         "nearest_next_objective": record.nearest_next_objective,
+    #                         "unfinished_content": record.unfinished_content,
+    #                         "task_completed": record.task_completed,
+    #                         "time_cost": round(record.time_line.total_time(), 4),
+    #                         "token_usage": {
+    #                             "prompt_tokens": record.llm_details["prompt_tokens"],
+    #                             "completion_tokens": record.llm_details["completion_tokens"],
+    #                         },
+    #                     }
+    #                 )
 
-        time_cost = {
-            "total_time": round(total_time_cost, 4),
-            "act_time": 0,
-            "observation_time": 0,
-            "planning_time": 0,
-        }
-        for record in self.records:
-            if isinstance(record, ActRecord):
-                time_cost["act_time"] += record.time_line.total_time()
-            elif isinstance(record, ObservationRecord):
-                time_cost["observation_time"] += record.time_line.total_time()
-            elif isinstance(record, PlanningRecord):
-                time_cost["planning_time"] += record.time_line.total_time()
-        time_cost["act_time"] = round(time_cost["act_time"], 4)
-        time_cost["observation_time"] = round(time_cost["observation_time"], 4)
-        time_cost["planning_time"] = round(time_cost["planning_time"], 4)
+    #     time_cost = {
+    #         "total_time": round(total_time_cost, 4),
+    #         "act_time": 0,
+    #         "observation_time": 0,
+    #         "planning_time": 0,
+    #     }
+    #     for record in self.records:
+    #         if isinstance(record, ActRecord):
+    #             time_cost["act_time"] += record.time_line.total_time()
+    #         elif isinstance(record, ObservationRecord):
+    #             time_cost["observation_time"] += record.time_line.total_time()
+    #         elif isinstance(record, PlanningRecord):
+    #             time_cost["planning_time"] += record.time_line.total_time()
+    #     time_cost["act_time"] = round(time_cost["act_time"], 4)
+    #     time_cost["observation_time"] = round(time_cost["observation_time"], 4)
+    #     time_cost["planning_time"] = round(time_cost["planning_time"], 4)
 
-        out = {
-            "user_request": user_request,
-            "token": token,
-            "records": records,
-            "time_cost": time_cost,
-            "success": success,
-            "result": result,
-        }
+    #     out = {
+    #         "user_request": user_request,
+    #         "token": token,
+    #         "records": records,
+    #         "time_cost": time_cost,
+    #         "success": success,
+    #         "result": result,
+    #     }
 
-        with open(self.out_dir / "result.json", "w") as f:
-            json.dump(
-                out,
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
+    #     with open(self.out_dir / "result.json", "w") as f:
+    #         json.dump(
+    #             out,
+    #             f,
+    #             ensure_ascii=False,
+    #             indent=2,
+    #         )
 
-        return out
+    #     return out
 
-    @staticmethod
-    def save_report(
-        user_request: str, success: bool, result: str, token: dict, time_cost: dict, records: list, out_dir: Path
-    ):
-        report_lines: list[str] = []
+    # @staticmethod
+    # def save_report(
+    #     user_request: str, success: bool, result: str, token: dict, time_cost: dict, records: list, out_dir: Path
+    # ):
+    #     report_lines: list[str] = []
 
-        # Header
-        report_lines.append("# Task Execution Report")
-        report_lines.append("")
+    #     # Header
+    #     report_lines.append("# Task Execution Report")
+    #     report_lines.append("")
 
-        # Part 1: Overall Summary
-        report_lines.append("## 1. Overall Summary")
-        report_lines.append("")
-        # User Request
-        report_lines.append("### User Request")
-        report_lines.append("")
-        report_lines.append(f"> {user_request.strip()}")
-        report_lines.append("")
-        # Success
-        report_lines.append("### Task Result")
-        report_lines.append(f"- **Success**: {'✅ Yes' if success else '❌ No'}")
-        report_lines.append(f"- **Result**: {result}")
-        report_lines.append("")
-        # Token usage
-        report_lines.append("### Token Usage")
-        report_lines.append("")
-        report_lines.append("| Model | Prompt Tokens | Completion Tokens | Total Tokens |")
-        report_lines.append("|------|---------------|-------------------|--------------|")
-        for model_name, t in token.items():
-            report_lines.append(
-                f"| {model_name} | {t.get('prompt_tokens', 0)} | "
-                f"{t.get('completion_tokens', 0)} | {t.get('total_tokens', 0)} |"
-            )
-        report_lines.append("")
-        # Time cost
-        report_lines.append("### Time Cost (seconds)")
-        report_lines.append("")
-        report_lines.append("| Type | Time |")
-        report_lines.append("|------|------|")
-        report_lines.append(f"| Total | {time_cost['total_time']} |")
-        report_lines.append(f"| Act | {time_cost['act_time']} |")
-        report_lines.append(f"| Observation | {time_cost['observation_time']} |")
-        report_lines.append(f"| Planning | {time_cost['planning_time']} |")
-        report_lines.append("")
+    #     # Part 1: Overall Summary
+    #     report_lines.append("## 1. Overall Summary")
+    #     report_lines.append("")
+    #     # User Request
+    #     report_lines.append("### User Request")
+    #     report_lines.append("")
+    #     report_lines.append(f"> {user_request.strip()}")
+    #     report_lines.append("")
+    #     # Success
+    #     report_lines.append("### Task Result")
+    #     report_lines.append(f"- **Success**: {'✅ Yes' if success else '❌ No'}")
+    #     report_lines.append(f"- **Result**: {result}")
+    #     report_lines.append("")
+    #     # Token usage
+    #     report_lines.append("### Token Usage")
+    #     report_lines.append("")
+    #     report_lines.append("| Model | Prompt Tokens | Completion Tokens | Total Tokens |")
+    #     report_lines.append("|------|---------------|-------------------|--------------|")
+    #     for model_name, t in token.items():
+    #         report_lines.append(
+    #             f"| {model_name} | {t.get('prompt_tokens', 0)} | "
+    #             f"{t.get('completion_tokens', 0)} | {t.get('total_tokens', 0)} |"
+    #         )
+    #     report_lines.append("")
+    #     # Time cost
+    #     report_lines.append("### Time Cost (seconds)")
+    #     report_lines.append("")
+    #     report_lines.append("| Type | Time |")
+    #     report_lines.append("|------|------|")
+    #     report_lines.append(f"| Total | {time_cost['total_time']} |")
+    #     report_lines.append(f"| Act | {time_cost['act_time']} |")
+    #     report_lines.append(f"| Observation | {time_cost['observation_time']} |")
+    #     report_lines.append(f"| Planning | {time_cost['planning_time']} |")
+    #     report_lines.append("")
 
-        # Part 2: Execution Records
-        report_lines.append("## 2. Execution Records")
-        report_lines.append("")
+    #     # Part 2: Execution Records
+    #     report_lines.append("## 2. Execution Records")
+    #     report_lines.append("")
 
-        for idx, record in enumerate(records, start=1):
-            record_type = record["type"]
-            token_usage = record["token_usage"]
-            # Act Record
-            if record_type == "act":
-                report_lines.append(f"### {idx}. Act")
-                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-                report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
-                )
-                report_lines.append("")
-                report_lines.append("**Actions:**")
-                for action_idx, action in enumerate(record["actions"], start=1):
-                    success_flag = "✅" if action["success"] else "❌"
-                    report_lines.append(f"{action_idx}. **Action {action_idx}**")
-                    report_lines.append(f"    - **Raw**: {action['raw']}")
-                    report_lines.append(f"    - **Description**: {action['description']}")
-                    report_lines.append(f"    - **Success**: {success_flag}")
-                    if action.get("additional") is not None:
-                        report_lines.append(f"    - **Additional**: {action['additional']}")
+    #     for idx, record in enumerate(records, start=1):
+    #         record_type = record["type"]
+    #         token_usage = record["token_usage"]
+    #         # Act Record
+    #         if record_type == "act":
+    #             report_lines.append(f"### {idx}. Act")
+    #             report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+    #             report_lines.append(
+    #                 f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+    #             )
+    #             report_lines.append("")
+    #             report_lines.append("**Actions:**")
+    #             for action_idx, action in enumerate(record["actions"], start=1):
+    #                 success_flag = "✅" if action["success"] else "❌"
+    #                 report_lines.append(f"{action_idx}. **Action {action_idx}**")
+    #                 report_lines.append(f"    - **Raw**: {action['raw']}")
+    #                 report_lines.append(f"    - **Description**: {action['description']}")
+    #                 report_lines.append(f"    - **Success**: {success_flag}")
+    #                 if action.get("additional") is not None:
+    #                     report_lines.append(f"    - **Additional**: {action['additional']}")
 
-                    # 并排显示截图
-                    action_img = f"![Action]({action['action_screenshot_name']})"
-                    result_img = f"![Result]({action['result_screenshot_name']})" if action["success"] else ""
-                    if action["success"]:
-                        # 使用 HTML 表格并排
-                        img_html = f"<table><tr><td>{action_img}</td><td>{result_img}</td></tr></table>"
-                        report_lines.append(f"    - **Screenshots**: {img_html}")
-                    else:
-                        report_lines.append(f"    - **Action Screenshot**: {action_img}")
+    #                 # 并排显示截图
+    #                 action_img = f"![Action]({action['action_screenshot_name']})"
+    #                 result_img = f"![Result]({action['result_screenshot_name']})" if action["success"] else ""
+    #                 if action["success"]:
+    #                     # 使用 HTML 表格并排
+    #                     img_html = f"<table><tr><td>{action_img}</td><td>{result_img}</td></tr></table>"
+    #                     report_lines.append(f"    - **Screenshots**: {img_html}")
+    #                 else:
+    #                     report_lines.append(f"    - **Action Screenshot**: {action_img}")
 
-                report_lines.append("")
-            # Observation Record
-            elif record_type == "observation":
-                report_lines.append(f"### {idx}. Observation")
-                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-                report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
-                )
-                report_lines.append("")
-                report_lines.append("**Observation**:")
-                report_lines.append(record["observation"])
-                report_lines.append("")
-            # Planning Record
-            elif record_type == "planning":
-                report_lines.append(f"### {idx}. Planning")
-                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-                report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
-                )
-                report_lines.append(f"- **Task Completed**: {record['task_completed']}")
-                report_lines.append("")
+    #             report_lines.append("")
+    #         # Observation Record
+    #         elif record_type == "observation":
+    #             report_lines.append(f"### {idx}. Observation")
+    #             report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+    #             report_lines.append(
+    #                 f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+    #             )
+    #             report_lines.append("")
+    #             report_lines.append("**Observation**:")
+    #             report_lines.append(record["observation"])
+    #             report_lines.append("")
+    #         # Planning Record
+    #         elif record_type == "planning":
+    #             report_lines.append(f"### {idx}. Planning")
+    #             report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+    #             report_lines.append(
+    #                 f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+    #             )
+    #             report_lines.append(f"- **Task Completed**: {record['task_completed']}")
+    #             report_lines.append("")
 
-                if record["task_completed"]:
-                    report_lines.append("**Task Result:**")
-                    report_lines.append(record.get("task_result", ""))
-                else:
-                    report_lines.append("**Current State:**")
-                    report_lines.append(record.get("current_state", ""))
-                report_lines.append("")
+    #             if record["task_completed"]:
+    #                 report_lines.append("**Task Result:**")
+    #                 report_lines.append(record.get("task_result", ""))
+    #             else:
+    #                 report_lines.append("**Current State:**")
+    #                 report_lines.append(record.get("current_state", ""))
+    #             report_lines.append("")
 
-                if not record["task_completed"]:
-                    report_lines.append("**New Progress:**")
-                    report_lines.append(record.get("new_progress", ""))
-                    report_lines.append("")
+    #             if not record["task_completed"]:
+    #                 report_lines.append("**New Progress:**")
+    #                 report_lines.append(record.get("new_progress", ""))
+    #                 report_lines.append("")
 
-                    report_lines.append("**Nearest Next Objective:**")
-                    report_lines.append(record.get("nearest_next_objective", ""))
-                    report_lines.append("")
+    #                 report_lines.append("**Nearest Next Objective:**")
+    #                 report_lines.append(record.get("nearest_next_objective", ""))
+    #                 report_lines.append("")
 
-                    report_lines.append("")
-                    report_lines.append("**Unfinished Content:**")
-                    report_lines.append(record.get("unfinished_content", ""))
-                    report_lines.append("")
-                report_lines.append("")
+    #                 report_lines.append("")
+    #                 report_lines.append("**Unfinished Content:**")
+    #                 report_lines.append(record.get("unfinished_content", ""))
+    #                 report_lines.append("")
+    #             report_lines.append("")
 
-        # Write md file
-        report_path = out_dir / "report.md"
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(report_lines))
-        logger.info("Report saved to {}", report_path)
+    #     # Write md file
+    #     report_path = out_dir / "report.md"
+    #     with open(report_path, "w", encoding="utf-8") as f:
+    #         f.write("\n".join(report_lines))
+    #     logger.info("Report saved to {}", report_path)

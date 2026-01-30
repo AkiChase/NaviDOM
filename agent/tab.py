@@ -69,6 +69,28 @@ class TabManager:
             tabs_info.append(f"Previous Visible tab ID: {self.pre_tab_id}")
         return "\n".join(tabs_info)
 
+    async def get_cur_tab_info(self) -> dict:
+        front_tab = self.front_tab
+        return {
+            "tab_id": self.cur_tab_id,
+            "title": await front_tab.title(),
+            "url": front_tab.url,
+        }
+
+    @staticmethod
+    def compare_tab_info(new_tab_info: dict, old_tab_info: dict) -> str | None:
+        if new_tab_info["tab_id"] != old_tab_info["tab_id"]:
+            return "Tab switched, ID {} -> {}".format(old_tab_info["tab_id"], new_tab_info["tab_id"])
+        info = "Tab not switched."
+        changed = False
+        if new_tab_info["title"] != old_tab_info["title"]:
+            info += " Title '{}' -> '{}'.".format(old_tab_info["title"], new_tab_info["title"])
+            changed = True
+        if new_tab_info["url"] != old_tab_info["url"]:
+            info += " URL '{}' -> '{}'.".format(old_tab_info["url"], new_tab_info["url"])
+            changed = True
+        return info if changed else None
+
     @property
     def front_tab(self) -> Page:
         assert self.cur_tab_id is not None
