@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from io import BytesIO
 import os
+from pathlib import Path
 import platform
 import re
 from typing import Union, Tuple
@@ -169,3 +170,13 @@ def google_search_url(keywords: str) -> str:
 def bing_search_url(keywords: str) -> str:
     encoded = quote(keywords, safe="")
     return f"https://www.bing.com/search?q={encoded}"
+
+
+def load_prompts():
+    prompt_dir = Path(__file__).parent / "prompts"
+    prompts = {}
+    for prompt_file in prompt_dir.glob("*.md"):
+        with open(prompt_file, "r", encoding="utf-8") as f:
+            prompts[prompt_file.stem] = f.read().strip()
+    logger.info(f"Loaded {len(prompts)} prompts: {prompts.keys()}")
+    return prompts

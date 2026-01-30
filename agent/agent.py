@@ -4,6 +4,7 @@ import itertools
 import json
 from pathlib import Path
 import re
+from typing import Awaitable, cast
 from loguru import logger
 from playwright.async_api import BrowserContext
 from PIL import ImageFont, ImageDraw, Image, ImageChops
@@ -28,11 +29,13 @@ from agent.utils import (
     gen_uid,
     load_default_font,
     bg_colors,
+    load_prompts,
     tab_screenshot,
 )
 
 
 class Agent:
+    prompts_dict: dict[str, str]
     context: BrowserContext
     tab_manager: TabManager
     out_dir: Path
@@ -43,9 +46,9 @@ class Agent:
     last_act_record: ActRecord | None = None
     last_observation_record: ObservationRecord | None
     progress: list[str]
-    memory: list[str]
 
     def __init__(self, out_dir: Path, context: BrowserContext, user_request: str):
+        self.prompts_dict = load_prompts()
         self.context = context
         self.tab_manager = TabManager(context)
         self.out_dir = out_dir
@@ -56,19 +59,13 @@ class Agent:
         self.last_act_record = None
         self.last_observation_record = None
         self.progress = []
-        self.memory = []
 
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_formatted_progress(self) -> str:
+    def get_formated_progress_history(self) -> str:
         if not self.progress:
             return "No entries."
         return "\n".join(self.progress)
-
-    def get_formatted_memory(self) -> str:
-        if not self.memory:
-            return "No entries."
-        return "\n".join(self.memory)
 
     async def run(self, start_url: str | None = None):
         start_time = datetime.now()
@@ -79,10 +76,14 @@ class Agent:
             await self.tab_manager.front_tab.goto(start_url)
         else:
             # 初次导航
+            before_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
+            before_act_tabs_info = await self.tab_manager.get_tabs_info()
             await self.act_initial()
+            await self.observation(before_act_screenshot, before_act_tabs_info)
 
         # 初次规划
-        await self.planning_initial()
+        extract_data_task = await self.planning()
+        # TODO 下一轮planning要等待extract_data_task完成
 
         iteration_times = 0
         while True:
@@ -99,7 +100,8 @@ class Agent:
 
             assert self.last_planning_record is not None
             if self.last_planning_record.task_completed:
-                logger.success(f"[Planning] Task completed: {self.last_planning_record.current_state}")
+                # TODO 这里等待Extract（甚至其返回的Feedback）否则主动执行一次Feedback
+                # logger.success(f"[Planning] Task completed: {self.last_planning_record.current_state}")
                 break
 
             if iteration_times >= Config.max_iteration_times:
@@ -115,6 +117,133 @@ class Agent:
         )
         out = self.save_result((end_time - start_time).total_seconds())
         self.save_report(**out, out_dir=self.out_dir)
+
+    def parse_response(
+        self,
+        content: str,
+        pattern_list: list[re.Pattern | None],
+    ):
+        fields: list[str | None] = [None] * len(pattern_list)
+        for i, pattern in enumerate(pattern_list):
+            if pattern is None:
+                continue
+            match = pattern.search(content)
+            if match is not None:
+                fields[i] = match.group(1).strip()
+                assert isinstance(fields[i], str)
+            else:
+                break
+
+        return fields
+
+    async def feedback(self):
+        pass
+
+    async def extract(self, req_data_found: str) -> asyncio.Task:
+        # TODO 解析并视情况执行
+        # TODO 如果执行了记得再执行一个Feedback（无所谓结束时机）应该返回这个feedback相关的Task，任务结束可能需要等待
+        feed_back_task = asyncio.create_task(self.feedback())
+        return feed_back_task
+
+    async def planning(self):
+        time_line = TimeLine()
+        record_index = len(self.records) + 1
+        logger.info(f"[{record_index:03}] Planning")
+
+        if self.last_planning_record is None:
+            last_task_state = "The first Planning. No Last Task State."
+            last_act_goal = "The first Planning. No Last Act Goal."
+        else:
+            last_task_state = self.last_planning_record.task_state
+            last_act_goal = self.last_planning_record.act_goal
+
+        if self.last_act_record is None:
+            last_act = "Navigate to the initial page (See Current Tabs for details)."
+        else:
+            last_act = []
+            for index, d in enumerate(self.last_act_record.action_details_list, 1):
+                if d.execute_result["success"]:
+                    assert d.action is not None
+                    last_act.append(f"{index}. {d.action.get_description()}")
+                else:
+                    last_act.append(
+                        f"{index}. Failed to execute {d.raw_action}, reason: {d.execute_result['additional']}"
+                    )
+            last_act = "\n".join(last_act)
+
+        if self.last_observation_record is None:
+            last_act_observation = "The first Planning. No Last Act Observation."
+        else:
+            last_act_observation = self.last_observation_record.observation
+
+        cur_tab = self.tab_manager.front_tab
+        screenshot = await tab_screenshot(cur_tab)
+
+        screenshot = await tab_screenshot(cur_tab)
+        time_line.add("fetch")
+
+        prompt = self.prompts_dict["planning"].format(
+            user_request=self.user_request,
+            progress_history="No entries.",
+            last_task_state=last_task_state,
+            last_act_goal=last_act_goal,
+            last_act=last_act,
+            last_act_observation=last_act_observation,
+            current_tabs=self.tab_manager.get_tabs_info(),
+        )
+
+        new_progress_pattern = re.compile(r"<New Progress>(.*?)</New Progress>", re.DOTALL)
+        requested_data_found_pattern = re.compile(r"<Requested Data Found>(.*?)</Requested Data Found>", re.DOTALL)
+        task_state_pattern = re.compile(r"<Task State>(.*?)</Task State>", re.DOTALL)
+        act_goal_pattern = re.compile(r"<Act Goal>(.*?)</Act Goal>", re.DOTALL)
+
+        extract_data_task = None
+
+        async def hook_extract_and_feedback(content: str):
+            nonlocal extract_data_task
+            if extract_data_task is not None:
+                return
+            requested_data_found = self.parse_response(content, [requested_data_found_pattern])[0]
+            if requested_data_found is None:
+                return
+            extract_data_task = asyncio.create_task(self.extract(requested_data_found))
+
+        llm_details = await PrimaryLLM.chat_with_image_detail(prompt, screenshot, hook=hook_extract_and_feedback)
+        time_line.add("llm")
+
+        content = llm_details["content"]
+        fields = self.parse_response(
+            content, [new_progress_pattern, requested_data_found_pattern, task_state_pattern, act_goal_pattern]
+        )
+        new_progress, requested_data_found, task_state, act_goal = fields
+        assert new_progress is not None, "Failed to parse expected New Progress in LLM response"
+        assert requested_data_found is not None, "Failed to parse expected Requested Data Found in LLM response"
+        assert task_state is not None, "Failed to parse expected Task State in LLM response"
+        assert act_goal is not None, "Failed to parse expected Act Goal in LLM response"
+        task_completed = "TASK_FULLY_FINISHED" in task_state and "TASK_FULLY_FINISHED" in act_goal
+
+        logger.debug(f"[New Progress] {new_progress}")
+        logger.debug(f"[Requested Data Found] {requested_data_found}")
+        logger.debug(f"[Task State] {task_state}")
+        logger.debug(f"[Act Goal] {act_goal}")
+
+        time_line.add("end")
+        record = PlanningRecord(
+            index=record_index,
+            llm_details=llm_details,
+            new_progress=new_progress,
+            requested_data_found=requested_data_found,
+            task_state=task_state,
+            act_goal=act_goal,
+            task_completed=task_completed,
+            time_line=time_line,
+        )
+        record.save(self.out_dir)
+        self.records.append(record)
+        self.last_planning_record = record
+
+        assert isinstance(extract_data_task, asyncio.Task), "Failed to create extract data task"
+        return extract_data_task
 
     async def observation(self, before_act_screenshot: Image.Image, before_act_tabs_info: str):
         cur_tab = self.tab_manager.front_tab
@@ -193,225 +322,6 @@ Important constraints:
         self.records.append(record)
         self.last_observation_record = record
 
-    async def planning_initial(self):
-        cur_tab = self.tab_manager.front_tab
-        time_line = TimeLine()
-        record_index = len(self.records) + 1
-        logger.info(f"[{record_index:03}] Planning initial")
-
-        screenshot = await tab_screenshot(cur_tab)
-        time_line.add("fetch")
-
-        prompt = f"""
-You are a web AI agent designed to make a planning to accomplish the given user request in browser.
-Your job is to analyze the current situation and produce a concise, structured plan.
-
-## Requirements
-- Do not invent or assume information that is not explicitly provided.
-- The user-requested information must be explicitly recorded in Stored Memory; when it is observable on the page, set recording it as the Nearest Next Objective.
-- If modal or alert exists on the page, set close it as the Nearest Next Objective;
-- The output should strictly follow the structure and heading format below:
-[New Progress]
-If no progress is made, write explicitly NO_PROGRESS
-Else, describe in one concise sentence: the NEW, recordable, meaningful progress toward the User Request.
-[Current State]
-Describe in one concise sentence: what the tab page currently represents and and the current overall state of the task.
-[Nearest Next Objective]
-Describe in one concise sentence: the single most immediate, concrete, actionable sub-goal to advance the task.
-[Unfinished Content]
-Describe in one concise sentence: which specific requirements or sub-tasks from the User Request are still not completed or not addressed based on the current progress.
-
-## User Request
-{self.user_request}
-
-## Browser Tabs
-{await self.tab_manager.get_tabs_info()}
-        """.strip()
-
-        llm_details = await PrimaryLLM.chat_with_image_detail(prompt, screenshot)
-        time_line.add("llm")
-
-        content = llm_details["content"]
-        pattern = re.compile(r"\[New Progress\]\s*(.*?)\s*(?=\[Current State\]|\Z)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        new_progress: str = match.group(1).strip()
-        no_progress = True
-        if new_progress.upper().find("NO_PROGRESS") == -1:
-            self.progress.append(new_progress)
-            no_progress = False
-
-        pattern = re.compile(r"\[Current State\]\s*(.*?)\s*(?=\[Nearest Next Objective\]|\Z)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        current_state: str = match.group(1).strip()
-
-        pattern = re.compile(r"\[Nearest Next Objective\]\s*(.*?)\s*(?=\[Unfinished Content\]|\Z)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        nearest_next_objective: str = match.group(1).strip()
-
-        pattern = re.compile(r"\[Unfinished Content\]\s*(.*)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        unfinished_content: str = match.group(1).strip()
-
-        if not no_progress:
-            logger.debug(f"[New Progress] {new_progress}")
-        logger.debug(f"[Current State] {current_state}")
-        logger.debug(f"[Nearest Next Objective] {nearest_next_objective}")
-        logger.debug(f"[Unfinished Content] {unfinished_content}")
-
-        time_line.add("end")
-        record = PlanningRecord(
-            index=record_index,
-            llm_details=llm_details,
-            new_progress=None if no_progress else new_progress,
-            current_state=current_state,
-            action_reflection=None,
-            nearest_next_objective=nearest_next_objective,
-            unfinished_content=unfinished_content,
-            task_completed=False,
-            time_line=time_line,
-        )
-        record.save(self.out_dir)
-        self.records.append(record)
-        self.last_planning_record = record
-
-    async def planning(self):
-        time_line = TimeLine()
-        record_index = len(self.records) + 1
-        logger.info(f"[{record_index:03}] Planning")
-
-        assert self.last_planning_record is not None
-        assert self.last_observation_record is not None
-        assert self.last_act_record is not None
-
-        actions_info = []
-        for index, d in enumerate(self.last_act_record.action_details_list, 1):
-            if d.execute_result["success"]:
-                assert d.action is not None
-                actions_info.append(f"{index}. {d.action.get_description()}")
-            else:
-                actions_info.append(
-                    f"{index}. Failed to execute {d.raw_action}, reason: {d.execute_result['additional']}"
-                )
-        actions_info = "\n".join(actions_info)
-
-        time_line.add("fetch")
-
-        prompt = f"""
-You are a web AI agent designed to make a planning to accomplish the given user request in browser.
-Your job is to analyze the current situation and produce a concise, structured plan, or determine that the task has already been completed.
-
-## Requirements
-- Do not invent or assume information that is not explicitly provided.
-- The user-requested information must be explicitly recorded in Stored Memory; when it is observable on the page, set recording it as the Nearest Next Objective.
-- If modal or alert exists on the page, set close it as the Nearest Next Objective;
-- The output should strictly follow the structure and heading format below:
-[New Progress]
-If no progress is made, write explicitly: NO_PROGRESS
-Else, describe in one concise sentence: the NEW, meaningful progress toward the User Request.
-[Current State]
-If the task is totally completed, write explicitly: TASK_COMPLETED, <user request required output>
-Else, describe in one concise sentence: the current overall task state, indicating what has been achieved so far and where the task stands now.
-[Action reflection]
-If the latest action execution works well, write explicitly: NO_REFLECTION.
-Else, describe in one concise sentence: analyze the result of the latest action execution to specify any mistakes, risks, or constraints that the next action should avoid.
-[Nearest Next Objective]
-If the task is totally completed, write explicitly: TASK_COMPLETED.
-Else, describe in one concise sentence: the single most immediate, concrete, actionable sub-goal to advance the task
-[Unfinished Content]
-If the task is totally completed, write explicitly: TASK_COMPLETED.
-Else, describe in one concise sentence: which specific requirements or sub-tasks from the User Request are still not completed or not addressed based on the current progress.
-
-## User Request
-{self.user_request}
-
-## Previous Planning Result
-Previous Task State: {self.last_planning_record.current_state}
-Previous Nearest Next Objective: {self.last_planning_record.nearest_next_objective}
-Previous Unfinished Content: {self.last_planning_record.unfinished_content}
-
-## Historical Progress
-The task progress entries recorded in historical iterations:
-{self.get_formatted_progress()}
-
-## Stored Memory
-The stored information related to the user request output in historical actions:
-{self.get_formatted_memory()}
-
-## Latest Action Details
-The following information describes the actions executed just now:
-{actions_info}
-
-## Observation Details
-This section contains Observation of the UI after the execution of actions in Last Action Details.
-Observation: {self.last_observation_record.observation}
-        """.strip()
-
-        llm_details = await PrimaryLLM.chat_with_text_detail(prompt)
-        time_line.add("llm")
-
-        content = llm_details["content"].strip()
-        no_progress = True
-        no_reflection = True
-        task_completed = False
-
-        pattern = re.compile(r"\[New Progress\]\s*(.*?)\s*(?=\[Current State\]|\Z)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        new_progress: str = match.group(1).strip()
-        if new_progress.upper().find("NO_PROGRESS") == -1:
-            self.progress.append(new_progress)
-            no_progress = False
-
-        pattern = re.compile(r"\[Current State\]\s*(.*?)\s*(?=\[Action reflection\]|\Z)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        current_state: str = match.group(1).strip()
-        if current_state.upper().find("TASK_COMPLETED") != -1:
-            task_completed = True
-
-        pattern = re.compile(r"\[Action reflection\]\s*(.*?)\s*(?=\[Nearest Next Objective\]|\Z)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        action_reflection: str = match.group(1).strip()
-        if action_reflection.upper().find("NO_REFLECTION") == -1:
-            no_reflection = False
-
-        pattern = re.compile(r"\[Nearest Next Objective\]\s*(.*?)\s*(?=\[Unfinished Content\]|\Z)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        nearest_next_objective: str = match.group(1).strip()
-
-        pattern = re.compile(r"\[Unfinished Content\]\s*(.*)", re.DOTALL)
-        match = pattern.search(content)
-        assert match is not None
-        unfinished_content: str = match.group(1).strip()
-
-        logger.debug(f"[New Progress] {new_progress}")
-        logger.debug(f"[Action reflection] {action_reflection}")
-        logger.debug(f"[Current State] {current_state}")
-        logger.debug(f"[Nearest Next Objective] {nearest_next_objective}")
-        logger.debug(f"[Unfinished Content] {unfinished_content}")
-
-        time_line.add("end")
-        record = PlanningRecord(
-            index=record_index,
-            llm_details=llm_details,
-            new_progress=None if no_progress else new_progress,
-            current_state=current_state,
-            action_reflection=None if no_reflection else action_reflection,
-            nearest_next_objective=nearest_next_objective,
-            unfinished_content=unfinished_content,
-            task_completed=task_completed,
-            time_line=time_line,
-        )
-        record.save(self.out_dir)
-        self.records.append(record)
-        self.last_planning_record = record
-
     async def act_initial(self):
         cur_tab = self.tab_manager.front_tab
 
@@ -455,7 +365,7 @@ User Request:
         action_screenshot.save(action_screenshot_path)
         execute_result: ActionExecuteResult = {
             "success": True,
-            "additional": await action.execute(cur_tab, self.tab_manager, None, self.memory),
+            "additional": await action.execute(cur_tab, self.tab_manager),
         }
 
         result_screenshot = await tab_screenshot(cur_tab)
@@ -485,21 +395,16 @@ User Request:
         record_index = len(self.records) + 1
         record_prefix = f"{record_index:03}_act"
         cur_tab = self.tab_manager.front_tab
-
         time_line = TimeLine()
-        assert self.last_planning_record is not None
-        next_objective = self.last_planning_record.nearest_next_objective
-        current_state = self.last_planning_record.current_state
-        action_reflection = (
-            f"Action Reflection: {self.last_planning_record.action_reflection}"
-            if self.last_planning_record.action_reflection is not None
-            else ""
-        )
         logger.info(f"[{record_index:03}] Act")
+
+        assert self.last_planning_record is not None
+        act_goal = self.last_planning_record.act_goal
+        task_state = self.last_planning_record.task_state
 
         dom_state = await DomState.load_dom_state(cur_tab)
         screenshot = await tab_screenshot(cur_tab)
-        tree = dom_state.dom
+        dom = dom_state.dom
         viewport = dom_state.viewport
         time_line.add("fetch")
 
@@ -507,10 +412,10 @@ User Request:
             # 最细粒度元素可视化
             atomic_screenshot = screenshot.copy()
             atomic_screenshot_draw = ImageDraw.Draw(atomic_screenshot)
-            tree.draw_bounds(atomic_screenshot_draw, draw_id=True)
+            dom.draw_bounds(atomic_screenshot_draw, draw_id=True)
             atomic_screenshot.save(self.out_dir / f"{record_prefix}_debug_1_atomic.jpg")
 
-        interactive_nodes = tree.extract_interactive_nodes(tree)
+        interactive_nodes = dom.extract_interactive_nodes(dom)
 
         if Config.debug:
             # 交互粒度元素可视化
@@ -596,7 +501,7 @@ User Request:
                     cluster_region_draw.rectangle(node_bounds, outline="red", width=2)
                 if Config.debug:
                     cluster_region.save(self.out_dir / f"{record_prefix}_debug_4_cluster_{index + 1}.jpg")
-                related_tasks.append(DomCluster.determine_cluster_related(cluster, cluster_region, task=next_objective))
+                related_tasks.append(DomCluster.determine_cluster_related(cluster, cluster_region, task=act_goal))
             related_tasks_res = await asyncio.gather(*related_tasks)
             related_cluster = [
                 (cluster, rect) for (flag, _), cluster, rect in zip(related_tasks_res, clusters, related_rects) if flag
@@ -609,6 +514,7 @@ User Request:
             if not related_cluster:
                 logger.warning("[Pruning] All unrelated, fallback to no pruning")
                 fallback = True
+                # TODO 这里需要特殊处理，不要再fallback了，应该是在prompt中提示无相关Node然后available_actions中不包含Click之类Action
             else:
                 # 合并边界存在重叠的区域，用于构建紧凑的UI图
                 merged_rects = DomCluster.cluster_merge_overlapped(related_cluster)
@@ -618,6 +524,7 @@ User Request:
                     itertools.chain.from_iterable(cluster for cluster, _ in related_cluster)
                 )
 
+        # 去除fallback
         if fallback:
             # 回退到无语义剪枝
             final_screenshot = screenshot.copy()
@@ -656,9 +563,9 @@ Based on the Task Description, construct appropriate Actions to move the task to
 
 ## Task Description
 User Request: {self.user_request}
-Current State: {current_state}
+Current State: {task_state}
 {action_reflection}
-Nearest Next Objective: {next_objective}
+Nearest Next Objective: {act_goal}
 
 ## Browser Tabs
 {await self.tab_manager.get_tabs_info()}
@@ -679,10 +586,10 @@ Nearest Next Objective: {next_objective}
         raw_action_types = [raw_action.split(",", maxsplit=1)[0].strip() for raw_action in raw_action_list]
         logger.debug(f"[Action] Generate {len(raw_action_list)} actions: [{', '.join(raw_action_types)}]")
 
-        old_tab_id = self.tab_manager.latest_tab_id
+        old_tab_id = self.tab_manager.cur_tab_id
         for action_index, raw_action in enumerate(raw_action_list, 1):
             # tab changed, skip rest actions
-            tab_changed = self.tab_manager.latest_tab_id != old_tab_id
+            tab_changed = self.tab_manager.cur_tab_id != old_tab_id
             last_action_failed = (
                 False if not action_details_list else action_details_list[-1].execute_result["success"] == False
             )
@@ -748,7 +655,7 @@ Nearest Next Objective: {next_objective}
                 # execute action
                 execute_result: ActionExecuteResult = {
                     "success": True,
-                    "additional": await action.execute(cur_tab, self.tab_manager, tree, self.memory),
+                    "additional": await action.execute(cur_tab, self.tab_manager),
                 }
                 # update latest tab
                 cur_tab = self.tab_manager.front_tab

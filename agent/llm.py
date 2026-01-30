@@ -1,5 +1,5 @@
 import base64
-from typing import TypedDict
+from typing import Awaitable, Callable, TypedDict
 from io import BytesIO
 import time
 from openai import AsyncOpenAI as AsyncClient
@@ -90,7 +90,9 @@ class PrimaryLLM:
         cls.token_dict[model]["total_tokens"] += usage.total_tokens
 
     @classmethod
-    async def chat_with_text_detail(cls, prompt: str, **kwargs) -> ChatTextDetails:
+    async def chat_with_text_detail(
+        cls, prompt: str, hook: Callable[[str], Awaitable[None]] | None = None, **kwargs
+    ) -> ChatTextDetails:
         params = {
             "model": cls.text_model,
             "messages": [
@@ -112,7 +114,7 @@ class PrimaryLLM:
 
         start_time = time.time()
         first_token_time = None
-        full_content = []
+        full_content = ""
         usage = None
 
         try:
@@ -126,7 +128,9 @@ class PrimaryLLM:
                 if delta.content:
                     if first_token_time is None:
                         first_token_time = time.time()
-                    full_content.append(delta.content)
+                    full_content += delta.content
+                    if hook is not None:
+                        await hook(full_content)
 
             assert first_token_time is not None
             assert usage is not None
@@ -146,14 +150,21 @@ class PrimaryLLM:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
-            "content": "".join(full_content),
+            "content": full_content,
             "total_time": end_time - start_time,
             "ttft": first_token_time - start_time,
             "tps": completion_tokens / (end_time - first_token_time),
         }
 
     @classmethod
-    async def chat_with_image_detail(cls, prompt: str, image: Image, default_fmt="JPEG", **kwargs) -> ChatImageDetails:
+    async def chat_with_image_detail(
+        cls,
+        prompt: str,
+        image: Image,
+        default_fmt="JPEG",
+        hook: Callable[[str], Awaitable[None]] | None = None,
+        **kwargs,
+    ) -> ChatImageDetails:
         base64_res = image_to_base64(image, default_fmt)
 
         params = {
@@ -178,7 +189,7 @@ class PrimaryLLM:
 
         start_time = time.time()
         first_token_time = None
-        full_content = []
+        full_content = ""
         usage = None
 
         try:
@@ -192,7 +203,9 @@ class PrimaryLLM:
                 if delta.content:
                     if first_token_time is None:
                         first_token_time = time.time()
-                    full_content.append(delta.content)
+                    full_content += delta.content
+                    if hook is not None:
+                        await hook(full_content)
 
             assert first_token_time is not None
             assert usage is not None
@@ -212,7 +225,7 @@ class PrimaryLLM:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
-            "content": "".join(full_content),
+            "content": full_content,
             "total_time": end_time - start_time,
             "ttft": first_token_time - start_time,
             "tps": completion_tokens / (end_time - first_token_time),
@@ -223,7 +236,12 @@ class PrimaryLLM:
 
     @classmethod
     async def chat_with_image_list_detail(
-        cls, prompt: str, image_list: list[Image], default_fmt="JPEG", **kwargs
+        cls,
+        prompt: str,
+        image_list: list[Image],
+        default_fmt="JPEG",
+        hook: Callable[[str], Awaitable[None]] | None = None,
+        **kwargs,
     ) -> ChatImageListDetails:
         base64_res_list = [image_to_base64(image, default_fmt) for image in image_list]
 
@@ -249,7 +267,7 @@ class PrimaryLLM:
 
         start_time = time.time()
         first_token_time = None
-        full_content = []
+        full_content = ""
         usage = None
 
         try:
@@ -263,7 +281,9 @@ class PrimaryLLM:
                 if delta.content:
                     if first_token_time is None:
                         first_token_time = time.time()
-                    full_content.append(delta.content)
+                    full_content += delta.content
+                    if hook is not None:
+                        await hook(full_content)
 
             assert first_token_time is not None
             assert usage is not None
@@ -283,7 +303,7 @@ class PrimaryLLM:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
-            "content": "".join(full_content),
+            "content": full_content,
             "total_time": end_time - start_time,
             "ttft": first_token_time - start_time,
             "tps": completion_tokens / (end_time - first_token_time),

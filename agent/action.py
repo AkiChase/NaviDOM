@@ -26,13 +26,10 @@ class ActionType(Enum):
     Input = "INPUT"
     Scroll = "SCROLL"
     Press = "PRESS"
-    Navigate = "NAVIGATE"
-    Search = "SEARCH"
     TabSwitch = "TAB_SWITCH"
     TabClose = "TAB_CLOSE"
-    Memory = "MEMORY"
-    ExtractAndMemory = "EXTRACT_AND_MEMORY"
-
+    Navigate = "NAVIGATE"
+    Search = "SEARCH"
 
 all_action_types = list(ActionType)
 
@@ -41,12 +38,12 @@ action_format_prompt = {
     ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// The target node must be editable (input or textarea). In <text>, only \\n has special meaning for line breaks; no other escaping is required",
     ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>. Minimum scroll increment is 0.1 pages",
     ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
+    ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to the specified tab making it the active and visible tab",
+    ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
     ActionType.Navigate: "NAVIGATE, <url>\t// Navigate to the specified URL",
     ActionType.Search: "SEARCH, <keywords>\t// Navigate to Bing search results for the given keywords",
-    ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to and activate the specified tab",
-    ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
-    ActionType.Memory: "MEMORY, <content>\t// If the user request requires certain information to be output, explicitly record <content> (\\n for line breaks) using this action.",
-    ActionType.ExtractAndMemory: "EXTRACT_AND_MEMORY, <subject>\t// The text in provided Interactive Nodes may be omitted. Use this action as an enhanced but more expensive version of MEMORY to extract content related to <subject> from the full text and record it.",
+    # ActionType.Memory: "MEMORY, <content>\t// If the user request requires certain information to be output, explicitly record <content> (\\n for line breaks) using this action.",
+    # ActionType.ExtractAndMemory: "EXTRACT_AND_MEMORY, <subject>\t// The text in provided Interactive Nodes may be omitted. Use this action as an enhanced but more expensive version of MEMORY to extract content related to <subject> from the full text and record it.",
 }
 
 
@@ -157,22 +154,20 @@ class Action:
             if tab_id not in tab_manager.tab_dict:
                 raise ActionParseException(f"Tab ID {tab_id} not found")
             return Action(uid, action_type, None, {"tab_id": tab_id})
-        elif action_type == ActionType.Memory:
-            # MEMORY, <content>
-            assert len(parts) == 2, ActionParseException(f"Invalid MEMORY format: {raw_action}")
-            content = parts[1].replace("\\n", "\n")
-            return Action(uid, action_type, None, {"content": content})
-        elif action_type == ActionType.ExtractAndMemory:
-            # EXTRACT_AND_MEMORY, <subject>
-            assert len(parts) == 2, ActionParseException(f"Invalid EXTRACT_AND_MEMORY format: {raw_action}")
-            subject = parts[1]
-            return Action(uid, action_type, None, {"subject": subject})
+        # elif action_type == ActionType.Memory:
+        #     # MEMORY, <content>
+        #     assert len(parts) == 2, ActionParseException(f"Invalid MEMORY format: {raw_action}")
+        #     content = parts[1].replace("\\n", "\n")
+        #     return Action(uid, action_type, None, {"content": content})
+        # elif action_type == ActionType.ExtractAndMemory:
+        #     # EXTRACT_AND_MEMORY, <subject>
+        #     assert len(parts) == 2, ActionParseException(f"Invalid EXTRACT_AND_MEMORY format: {raw_action}")
+        #     subject = parts[1]
+        #     return Action(uid, action_type, None, {"subject": subject})
         else:
             raise ActionParseException(f"Unsupported action type: {action_type}")
 
-    async def execute(self, tab: Page, tab_manager: "TabManager", dom: DomNode | None, memory: list[str]):
-        # 简单实现
-
+    async def execute(self, tab: Page, tab_manager: "TabManager"):
         if self.type in [ActionType.Click, ActionType.Input]:
             # find target in tab
             assert self.target is not None
@@ -193,7 +188,7 @@ class Action:
             # execute click/input action
             if self.type == ActionType.Click:
                 try:
-                    await loc.click(timeout=3000, force=True)
+                    await loc.click(timeout=5000, force=True)
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
                 await asyncio.sleep(1.5)
@@ -202,9 +197,9 @@ class Action:
                 text = self.extra["text"]
                 try:
                     if clear:
-                        await loc.fill(text, timeout=3000)
+                        await loc.fill(text, timeout=5000)
                     else:
-                        await loc.type(text, timeout=3000)
+                        await loc.type(text, timeout=5000)
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
                 await asyncio.sleep(1.5)
@@ -230,14 +225,14 @@ class Action:
             await asyncio.sleep(1)
         elif self.type == ActionType.TabSwitch:
             tab_id = self.extra["tab_id"]
-            if tab_id == tab_manager.latest_tab_id:
+            if tab_id == tab_manager.cur_tab_id:
                 raise ActionExecuteException(
                     f"Tab ID {tab_id} is already the current tab, you may want to scroll the tab page"
                 )
             if tab_id not in tab_manager.tab_dict:
                 raise ActionExecuteException(f"Tab ID {tab_id} not found in available tabs")
             tab = tab_manager.tab_dict[tab_id]
-            tab_manager.latest_tab_id = tab_id
+            tab_manager.cur_tab_id = tab_id
             await tab.bring_to_front()
             await asyncio.sleep(0.5)
         elif self.type == ActionType.TabClose:
@@ -247,18 +242,18 @@ class Action:
             tab = tab_manager.tab_dict[tab_id]
             await tab.close()
             await asyncio.sleep(0.5)
-        elif self.type == ActionType.Memory:
-            content = self.extra["content"]
-            memory.append(content)
-        elif self.type == ActionType.ExtractAndMemory:
-            if dom is None:
-                raise ActionExecuteException("DOM is None, cannot extract info")
-            subject = self.extra["subject"]
-            text_content = dom.convert_to_repr_node(skip_omit=True).get_human_tree_repr()
-            prompt = f"Extract the content strictly related to {subject} from the following HTML, ignoring HTML tags, and present it as a concise paragraph:\n{text_content}"
-            llm_detail = await SecondaryLLM.chat_with_text_detail(prompt)
-            memory.append(llm_detail["content"])
-            return llm_detail
+        # elif self.type == ActionType.Memory:
+        #     content = self.extra["content"]
+        #     memory.append(content)
+        # elif self.type == ActionType.ExtractAndMemory:
+        #     if dom is None:
+        #         raise ActionExecuteException("DOM is None, cannot extract info")
+        #     subject = self.extra["subject"]
+        #     text_content = dom.convert_to_repr_node(skip_omit=True).get_human_tree_repr()
+        #     prompt = f"Extract the content strictly related to {subject} from the following HTML, ignoring HTML tags, and present it as a concise paragraph:\n{text_content}"
+        #     llm_detail = await SecondaryLLM.chat_with_text_detail(prompt)
+        #     memory.append(llm_detail["content"])
+        #     return llm_detail
         else:
             raise NotImplementedError(f"Action type {self.type} is not implemented")
 

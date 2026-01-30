@@ -11,6 +11,10 @@ from agent.llm import ChatImageDetails, ChatImageListDetails, ChatTextDetails
 class Record:
     index: int
 
+    def save(self, out_dir: Path, name: str, data: dict):
+        with open(out_dir / f"{self.index:03}_{name}.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+
 
 class TimeLine:
     content: list[tuple[str, float]]
@@ -31,31 +35,64 @@ class TimeLine:
 
 @dataclass
 class PlanningRecord(Record):
-    llm_details: ChatTextDetails | ChatImageDetails
-    new_progress: str | None
-    current_state: str
-    action_reflection: str | None
-    nearest_next_objective: str
-    unfinished_content: str
+    llm_details: ChatImageDetails
+    new_progress: str
+    requested_data_found: str | None
+    task_state: str
+    act_goal: str
     task_completed: bool
     time_line: TimeLine
 
     def save(self, out_dir: Path):
-        with open(out_dir / f"{self.index:03}_planning.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "llm_details": self.llm_details,
-                    "new_progress": self.new_progress,
-                    "current_state": self.current_state,
-                    "action_reflection": self.action_reflection,
-                    "nearest_next_objective": self.nearest_next_objective,
-                    "unfinished_content": self.unfinished_content,
-                    "task_completed": self.task_completed,
-                },
-                f,
-                indent=4,
-                ensure_ascii=False,
-            )
+        super().save(
+            out_dir,
+            "planning",
+            {
+                "llm_details": self.llm_details,
+                "new_progress": self.new_progress,
+                "requested_data_found": self.requested_data_found,
+                "task_state": self.task_state,
+                "act_goal": self.act_goal,
+                "task_completed": self.task_completed,
+                "time_line": self.time_line.content,
+            },
+        )
+
+
+@dataclass
+class ExtractionRecord(Record):
+    llm_details: ChatImageDetails | None
+    data: str
+    time_line: TimeLine
+
+    def save(self, out_dir: Path):
+        super().save(
+            out_dir,
+            "extraction",
+            {
+                "llm_details": self.llm_details,
+                "data": self.data,
+                "time_line": self.time_line.content,
+            },
+        )
+
+
+@dataclass
+class FeedbackRecord(Record):
+    llm_details: ChatImageDetails | None
+    feedback: str
+    time_line: TimeLine
+
+    def save(self, out_dir: Path):
+        super().save(
+            out_dir,
+            "feedback",
+            {
+                "llm_details": self.llm_details,
+                "feedback": self.feedback,
+                "time_line": self.time_line.content,
+            },
+        )
 
 
 @dataclass
@@ -66,18 +103,16 @@ class ActRecord(Record):
     pruned_dom_repr: str
 
     def save(self, out_dir: Path):
-        with open(out_dir / f"{self.index:03}_act.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "action_details_list": [a.to_dict() for a in self.action_details_list],
-                    "time_line": self.time_line.content,
-                    "llm_details": self.llm_details,
-                    "pruned_dom_repr": self.pruned_dom_repr,
-                },
-                f,
-                indent=4,
-                ensure_ascii=False,
-            )
+        super().save(
+            out_dir,
+            "act",
+            {
+                "action_details_list": [a.to_dict() for a in self.action_details_list],
+                "time_line": self.time_line.content,
+                "llm_details": self.llm_details,
+                "pruned_dom_repr": self.pruned_dom_repr,
+            },
+        )
 
 
 @dataclass
@@ -87,14 +122,12 @@ class ObservationRecord(Record):
     time_line: TimeLine
 
     def save(self, out_dir: Path):
-        with open(out_dir / f"{self.index:03}_observation.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "llm_details": self.llm_details,
-                    "observation": self.observation,
-                    "time_line": self.time_line.content,
-                },
-                f,
-                indent=4,
-                ensure_ascii=False,
-            )
+        super().save(
+            out_dir,
+            "observation",
+            {
+                "llm_details": self.llm_details,
+                "observation": self.observation,
+                "time_line": self.time_line.content,
+            },
+        )
