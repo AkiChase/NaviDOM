@@ -25,15 +25,15 @@ Update the TODO List so that it:
 - Each item must have:
   - A short title or description of the subtask.
   - A STATUS, one of:
-    - DONE
-    - IN PROGRESS
-    - NOT STARTED
+    - ✅ DONE
+    - ⏳ IN PROGRESS
+    - 🔴 NOT STARTED
   - If DONE and the user expects specific data/output for that subtask, include the key results inline in that item, summarized from the New UI State or other known info.
 - The list should be ordered logically (roughly the order in which tasks must or should be done).
 - Do not include internal reasoning or chain-of-thought; only show the TODO list and essential explanations.
 
 ## Output Format
-1. [STATUS] Short task title
+1. [✅/⏳/🔴] Short task title
    - Description in 1–2 short sentences
    - If relevant data is expected: concise relevant data
 2. …

@@ -36,7 +36,7 @@ all_action_types = list(ActionType)
 
 action_format_prompt = {
     ActionType.Click: "CLICK, <node_id>",
-    ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// The target node must be editable (input or textarea). In <text>, only \\n has special meaning for line breaks; no other escaping is required",
+    ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// You can only input text into input or textarea nodes. In <text>, only \\n has special meaning for line breaks; no other escaping is required",
     ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>. Minimum scroll increment is 0.1 pages",
     ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to the specified tab making it the active and visible tab",

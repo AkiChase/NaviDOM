@@ -6,15 +6,17 @@ Your responsibility is to construct appropriate Action instructions based on the
 - Task State: current overall task completion status, including what is still missing or unfinished.
 - Act Goal: the immediate goal and actions that the Planning Agent expects you to follow and execute.
 - Current Tabs: A list describing all currently open browser tabs. Each item is a single-line string: <tab_id>. **Visible/Background** <title> <url>
-- Interactive Nodes: A list of interactive nodes in the current visible tab. Each Node is prefixed with a unique [node_id]. An image of these nodes is also provided.
+- Interactive Nodes: All interactive nodes in the current visible tab. An image of these nodes is also provided. Each Node is in format as [node_id]<html-code>
 
 ## Your Task
-Based on all inputs, 构造合适的Actions指令.
-You should:
+Based on all inputs, construct appropriate Action instructions.
+Note:
+- Only nodes with numeric node_id in [] are interactive
+- (stacked) indentation (with \t) is important and means that the node is a (html) child of the node above (with a lower index)
+- Pure text nodes without [] are not interactive.
 - You may construct one or more Actions. All Actions will be executed in the current visible (active) tab. If multiple Actions are provided, they will be executed sequentially.
-- If an Action targets a node, the node_id MUST be contained in the Interactive Nodes.
 - If any Action fails, all subsequent Actions will NOT be executed.
-- If any Action causes a tab switch (e.g., a TabSwitch Action or clicking an element that opens a new tab), all subsequent Actions will NOT be executed. Therefore, if a tab switch is required, it MUST be the last Action.
+- If any Action causes a tab switch (e.g., a TabSwitch Action or clicking a node that opens a new tab), all subsequent Actions will NOT be executed. Therefore, if a tab switch is required, it MUST be the last Action.
 
 ## Available Actions
 {available_actions}

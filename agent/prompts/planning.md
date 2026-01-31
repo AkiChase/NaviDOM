@@ -38,11 +38,11 @@ The output should contain the following sections:
 - If the task is fully complete, use: TASK_FULLY_FINISHED
 
 ## Output format
-You must output the sections in the following format:
-<New Progress>one-sentence summary</New Progress>
-<Requested Data Found>[FOUND] or [NOT_FOUND] with clear description</Requested Data Found>
-<Task State>one-sentence summary or TASK_FULLY_FINISHED</Task State>
-<Act Goal>one-sentence actionable next step with clear objective or TASK_FULLY_FINISHED</Act Goal>
+You must output the sections in the following format strictly:
+New Progress: one-sentence summary
+Requested Data Found: [FOUND] or [NOT_FOUND] with one-sentence and clear description
+Task State: one-sentence summary or TASK_FULLY_FINISHED
+Act Goal: one-sentence actionable next step with clear objective or TASK_FULLY_FINISHED
 
 ## Inputs Details
 **User Request**:

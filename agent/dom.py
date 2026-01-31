@@ -22,6 +22,23 @@ class Viewport:
     scroll_h: float
     scroll_w: float
 
+    @staticmethod
+    async def from_tab(tab: Page):
+        return Viewport(
+            await tab.evaluate(
+                """() => {
+                    return {
+                        "width": window.innerWidth,
+                        "height": window.innerHeight,
+                        "scrollY": window.scrollY,
+                        "scrollX": window.scrollX,
+                        "scrollH": document.body.scrollHeight,
+                        "scrollW": document.body.scrollWidth,
+                    }
+                }"""
+            )
+        )
+
     def __init__(self, viewport: dict[str, float]):
         self.width = viewport["width"]
         self.height = viewport["height"]
@@ -42,7 +59,7 @@ class Viewport:
     def get_viewport_scroll_info(self) -> str:
         up = self.remaining_up_pages
         down = self.remaining_down_pages
-        return f"Tab scroll info: can scroll up {up:.1f} pages, down {down:.1f} pages"
+        return f"Current Visible Tab scroll info: can scroll up {up:.1f} pages, down {down:.1f} pages"
 
 
 default_font = ImageFont.load_default()
@@ -442,7 +459,7 @@ class DomNode:
         return dfs(root)
 
 
-# Interactive nodes
+# Interactive Elements
 GROUP_ELEMENTS = {
     "a",
     "button",
@@ -676,7 +693,7 @@ class ReprDomNode:
 
     def _get_tree_repr(self, indent: int = 0, no_end=False, no_id=False):
         out = []
-        prefix = "  " * indent
+        prefix = "\t" * indent
         attr_str = ""
         # attributes
         if self.repr_attributes:

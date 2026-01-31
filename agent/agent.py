@@ -16,7 +16,7 @@ from agent.action import (
     ActionType,
 )
 from agent.config import Config
-from agent.dom import DomCluster, DomNode, DomState
+from agent.dom import DomCluster, DomNode, DomState, Viewport
 from agent.llm import PrimaryLLM, SecondaryLLM
 from agent.record import (
     ActRecord,
@@ -65,6 +65,8 @@ class Agent:
         self.last_planning_record = None
         self.last_act_record = None
         self.last_observation_record = None
+        self.last_extraction_record = None
+        self.last_feedback_record = None
         self.progress = []
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +127,8 @@ class Agent:
         logger.info(
             f"[Time] Per act time cost: {(end_time - start_time).total_seconds() / len([r for r in self.records if isinstance(r, ActRecord)]):.2f}s"
         )
+        if self.last_feedback_record is not None:
+            logger.info(f"[Feedback]:\n{self.last_feedback_record.feedback}")
         # out = self.save_result((end_time - start_time).total_seconds())
         # self.save_report(**out, out_dir=self.out_dir)
 
@@ -170,6 +174,7 @@ class Agent:
         )
         llm_detail = await SecondaryLLM.chat_with_text_detail(prompt)
         content = llm_detail["content"]
+        logger.info(f"[Feedback] Detail:\n{content}")
         time_line.add("llm")
 
         record = FeedbackRecord(
@@ -203,6 +208,7 @@ class Agent:
             time_line.add("llm")
 
             content = llm_detail["content"]
+            logger.debug(f"[Extraction] {content}")
             self.progress.append(content)
             record = ExtractionRecord(
                 index=record_index,
@@ -247,6 +253,9 @@ class Agent:
         cur_tab = self.tab_manager.front_tab
 
         screenshot = await tab_screenshot(cur_tab)
+        tabs_info = await self.tab_manager.get_tabs_info()
+        viewport = await Viewport.from_tab(cur_tab)
+        current_tabs = f"{tabs_info}\n{viewport.get_viewport_scroll_info()}"
         time_line.add("fetch")
 
         prompt = self.prompts_dict["planning"].format(
@@ -256,13 +265,13 @@ class Agent:
             last_act_goal=last_act_goal,
             last_act=last_act,
             last_act_observation=last_act_observation,
-            current_tabs=await self.tab_manager.get_tabs_info(),
+            current_tabs=current_tabs,
         )
 
-        new_progress_pattern = re.compile(r"<New Progress>(.*?)</New Progress>", re.DOTALL)
-        requested_data_found_pattern = re.compile(r"<Requested Data Found>(.*?)</Requested Data Found>", re.DOTALL)
-        task_state_pattern = re.compile(r"<Task State>(.*?)</Task State>", re.DOTALL)
-        act_goal_pattern = re.compile(r"<Act Goal>(.*?)</Act Goal>", re.DOTALL)
+        new_progress_pattern = re.compile(r"New Progress:\s*(.*?)\s*Requested Data Found:", re.DOTALL)
+        requested_data_found_pattern = re.compile(r"Requested Data Found:\s*(.*?)\s*Task State:", re.DOTALL)
+        task_state_pattern = re.compile(r"Task State:\s*(.*?)\s*Act Goal:", re.DOTALL)
+        act_goal_pattern = re.compile(r"Act Goal:\s*(.*)$", re.DOTALL)  # 到文本末尾
 
         extraction_task = None
 
@@ -448,6 +457,7 @@ User Request:
         dom_state = await DomState.load_dom_state(cur_tab)
         screenshot = await tab_screenshot(cur_tab)
         dom = dom_state.dom
+        viewport = dom_state.viewport
         time_line.add("fetch")
 
         if Config.debug:
@@ -565,18 +575,21 @@ User Request:
             final_nodes: list[DomNode] = list(itertools.chain.from_iterable(cluster for cluster, _ in related_cluster))
             if Config.debug:
                 final_screenshot.save(self.out_dir / f"{record_prefix}_debug_5_final.jpg")
-            interactive_nodes_repr = "\n\n".join(
+            interactive_nodes_repr = "\n".join(
                 [node.convert_to_repr_node().get_human_tree_repr(no_end=True) for node in final_nodes]
             )
             available_actions = Action.get_format_prompt(exclude_types=[ActionType.Search])
         time_line.add("pruning")
+
+        tabs_info = await self.tab_manager.get_tabs_info()
+        current_tabs = f"{tabs_info}\n{viewport.get_viewport_scroll_info()}"
 
         prompt = self.prompts_dict["act"].format(
             available_actions=available_actions,
             user_request=self.user_request,
             task_state=task_state,
             act_goal=act_goal,
-            current_tabs=await self.tab_manager.get_tabs_info(),
+            current_tabs=current_tabs,
             interactive_nodes=interactive_nodes_repr,
         )
 
