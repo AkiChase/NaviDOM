@@ -1,6 +1,8 @@
 import asyncio
+from collections import defaultdict
 from datetime import datetime
 import itertools
+import json
 from pathlib import Path
 import re
 from loguru import logger
@@ -129,8 +131,8 @@ class Agent:
         )
         if self.last_feedback_record is not None:
             logger.info(f"[Feedback]:\n{self.last_feedback_record.feedback}")
-        # out = self.save_result((end_time - start_time).total_seconds())
-        # self.save_report(**out, out_dir=self.out_dir)
+        out = self.save_result((end_time - start_time).total_seconds())
+        self.save_report(**out, out_dir=self.out_dir)
 
     def parse_response(
         self,
@@ -718,271 +720,306 @@ User Request:
         self.records[record_index] = record
         self.last_act_record = record
 
-    # def save_result(self, total_time_cost: float):
-    #     user_request = self.user_request
-    #     token = PrimaryLLM.token_dict
-    #     for k, v in SecondaryLLM.token_dict.items():
-    #         if k not in token:
-    #             token[k] = v
-    #         else:
-    #             token[k]["completion_tokens"] += v["completion_tokens"]
-    #             token[k]["prompt_tokens"] += v["prompt_tokens"]
-    #             token[k]["total_tokens"] += v["total_tokens"]
+    def save_result(self, total_time_cost: float):
+        user_request = self.user_request
+        token = PrimaryLLM.token_dict
+        for k, v in SecondaryLLM.token_dict.items():
+            if k not in token:
+                token[k] = v
+            else:
+                token[k]["completion_tokens"] += v["completion_tokens"]
+                token[k]["prompt_tokens"] += v["prompt_tokens"]
+                token[k]["total_tokens"] += v["total_tokens"]
 
-    #     success = self.last_planning_record is not None and self.last_planning_record.task_completed
-    #     if success:
-    #         assert self.last_planning_record is not None
-    #         result = self.last_planning_record.current_state
-    #     else:
-    #         result = "Task failed."
+        success = self.last_planning_record is not None and self.last_planning_record.task_completed
+        if success:
+            assert self.last_planning_record is not None
+            task_result = self.last_planning_record.task_state
+        else:
+            task_result = "Task failed."
+            if self.last_planning_record is not None:
+                task_result += f" {self.last_planning_record.task_state}"
 
-    #     records = []
-    #     for record in self.records:
-    #         if isinstance(record, ActRecord):
-    #             prompt_tokens = record.llm_details["prompt_tokens"]
-    #             completion_tokens = record.llm_details["completion_tokens"]
-    #             for d in record.action_details_list:
-    #                 additional = d.execute_result["additional"]
-    #                 if (
-    #                     isinstance(additional, dict)
-    #                     and "prompt_tokens" in additional
-    #                     and "completion_tokens" in additional
-    #                 ):
-    #                     prompt_tokens += additional["prompt_tokens"]
-    #                     completion_tokens += additional["completion_tokens"]
+        records = []
+        for record in self.records:
+            if isinstance(record, ActRecord):
+                records.append(
+                    {
+                        "type": "act",
+                        "actions": [
+                            {
+                                "raw": d.raw_action,
+                                "description": d.action.get_description() if d.action is not None else "Parse Failed",
+                                "success": d.execute_result["success"],
+                                "action_screenshot_name": d.action_screenshot_path.name,
+                                "result_screenshot_name": d.result_screenshot_path.name,
+                                "result": d.execute_result["result"],
+                            }
+                            for d in record.action_details_list
+                        ],
+                        "token_usage": {
+                            "prompt_tokens": record.llm_details["prompt_tokens"],
+                            "completion_tokens": record.llm_details["completion_tokens"],
+                        },
+                        "time_cost": round(record.time_line.total_time(), 4),
+                    }
+                )
+            elif isinstance(record, ObservationRecord):
+                token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+                if record.llm_details is not None:
+                    token_usage["prompt_tokens"] = record.llm_details["prompt_tokens"]
+                    token_usage["completion_tokens"] = record.llm_details["completion_tokens"]
 
-    #             records.append(
-    #                 {
-    #                     "type": "act",
-    #                     "actions": [
-    #                         {
-    #                             "raw": d.raw_action,
-    #                             "description": d.action.get_description() if d.action is not None else "Parse Failed",
-    #                             "success": d.execute_result["success"],
-    #                             "action_screenshot_name": d.action_screenshot_path.name,
-    #                             "result_screenshot_name": d.result_screenshot_path.name,
-    #                             "additional": (
-    #                                 d.execute_result["additional"]["content"]
-    #                                 if isinstance(d.execute_result["additional"], dict)
-    #                                 else d.execute_result["additional"]
-    #                             ),
-    #                         }
-    #                         for d in record.action_details_list
-    #                     ],
-    #                     "token_usage": {
-    #                         "prompt_tokens": prompt_tokens,
-    #                         "completion_tokens": completion_tokens,
-    #                     },
-    #                     "time_cost": round(record.time_line.total_time(), 4),
-    #                 }
-    #             )
-    #         elif isinstance(record, ObservationRecord):
-    #             token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    #             if record.llm_details is not None:
-    #                 token_usage["prompt_tokens"] = record.llm_details["prompt_tokens"]
-    #                 token_usage["completion_tokens"] = record.llm_details["completion_tokens"]
+                records.append(
+                    {
+                        "type": "observation",
+                        "observation": record.observation,
+                        "time_cost": round(record.time_line.total_time(), 4),
+                        "token_usage": token_usage,
+                    }
+                )
+            elif isinstance(record, PlanningRecord):
+                records.append(
+                    {
+                        "type": "planning",
+                        "new_progress": record.new_progress,
+                        "requested_data_found": record.requested_data_found,
+                        "task_state": record.task_state,
+                        "act_goal": record.act_goal,
+                        "task_completed": record.task_completed,
+                        "time_cost": round(record.time_line.total_time(), 4),
+                        "token_usage": {
+                            "prompt_tokens": record.llm_details["prompt_tokens"],
+                            "completion_tokens": record.llm_details["completion_tokens"],
+                        },
+                    }
+                )
+            elif isinstance(record, ExtractionRecord):
+                records.append(
+                    {
+                        "type": "extraction",
+                        "data": record.data,
+                        "time_cost": round(record.time_line.total_time(), 4),
+                        "token_usage": {
+                            "prompt_tokens": record.llm_details["prompt_tokens"],
+                            "completion_tokens": record.llm_details["completion_tokens"],
+                        },
+                    }
+                )
+            elif isinstance(record, FeedbackRecord):
+                records.append(
+                    {
+                        "type": "feedback",
+                        "feedback": record.feedback,
+                        "time_cost": round(record.time_line.total_time(), 4),
+                        "token_usage": {
+                            "prompt_tokens": record.llm_details["prompt_tokens"],
+                            "completion_tokens": record.llm_details["completion_tokens"],
+                        },
+                    }
+                )
 
-    #             records.append(
-    #                 {
-    #                     "type": "observation",
-    #                     "observation": record.observation,
-    #                     "time_cost": round(record.time_line.total_time(), 4),
-    #                     "token_usage": token_usage,
-    #                 }
-    #             )
-    #         elif isinstance(record, PlanningRecord):
-    #             if record.task_completed:
-    #                 records.append(
-    #                     {
-    #                         "type": "planning",
-    #                         "task_completed": record.task_completed,
-    #                         "task_result": record.current_state,
-    #                         "time_cost": round(record.time_line.total_time(), 4),
-    #                         "token_usage": {
-    #                             "prompt_tokens": record.llm_details["prompt_tokens"],
-    #                             "completion_tokens": record.llm_details["completion_tokens"],
-    #                         },
-    #                     }
-    #                 )
-    #             else:
-    #                 records.append(
-    #                     {
-    #                         "type": "planning",
-    #                         "current_state": record.current_state,
-    #                         "nearest_next_objective": record.nearest_next_objective,
-    #                         "unfinished_content": record.unfinished_content,
-    #                         "task_completed": record.task_completed,
-    #                         "time_cost": round(record.time_line.total_time(), 4),
-    #                         "token_usage": {
-    #                             "prompt_tokens": record.llm_details["prompt_tokens"],
-    #                             "completion_tokens": record.llm_details["completion_tokens"],
-    #                         },
-    #                     }
-    #                 )
+        time_cost = {
+            "total_time": round(total_time_cost, 4),
+            "act_time": 0,
+            "observation_time": 0,
+            "planning_time": 0,
+            "extraction_time": 0,
+            "feedback_time": 0,
+        }
+        for record in self.records:
+            if isinstance(record, ActRecord):
+                time_cost["act_time"] += record.time_line.total_time()
+            elif isinstance(record, ObservationRecord):
+                time_cost["observation_time"] += record.time_line.total_time()
+            elif isinstance(record, PlanningRecord):
+                time_cost["planning_time"] += record.time_line.total_time()
+            elif isinstance(record, ExtractionRecord):
+                time_cost["extraction_time"] += record.time_line.total_time()
+            elif isinstance(record, FeedbackRecord):
+                time_cost["feedback_time"] += record.time_line.total_time()
 
-    #     time_cost = {
-    #         "total_time": round(total_time_cost, 4),
-    #         "act_time": 0,
-    #         "observation_time": 0,
-    #         "planning_time": 0,
-    #     }
-    #     for record in self.records:
-    #         if isinstance(record, ActRecord):
-    #             time_cost["act_time"] += record.time_line.total_time()
-    #         elif isinstance(record, ObservationRecord):
-    #             time_cost["observation_time"] += record.time_line.total_time()
-    #         elif isinstance(record, PlanningRecord):
-    #             time_cost["planning_time"] += record.time_line.total_time()
-    #     time_cost["act_time"] = round(time_cost["act_time"], 4)
-    #     time_cost["observation_time"] = round(time_cost["observation_time"], 4)
-    #     time_cost["planning_time"] = round(time_cost["planning_time"], 4)
+        for key in ("act_time", "observation_time", "planning_time", "extraction_time", "feedback_time"):
+            time_cost[key] = round(time_cost[key], 4)
 
-    #     out = {
-    #         "user_request": user_request,
-    #         "token": token,
-    #         "records": records,
-    #         "time_cost": time_cost,
-    #         "success": success,
-    #         "result": result,
-    #     }
+        out = {
+            "user_request": user_request,
+            "token": token,
+            "records": records,
+            "time_cost": time_cost,
+            "success": success,
+            "result": task_result,
+        }
 
-    #     with open(self.out_dir / "result.json", "w") as f:
-    #         json.dump(
-    #             out,
-    #             f,
-    #             ensure_ascii=False,
-    #             indent=2,
-    #         )
+        with open(self.out_dir / "result.json", "w") as f:
+            json.dump(
+                out,
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
-    #     return out
+        return out
 
-    # @staticmethod
-    # def save_report(
-    #     user_request: str, success: bool, result: str, token: dict, time_cost: dict, records: list, out_dir: Path
-    # ):
-    #     report_lines: list[str] = []
+    @staticmethod
+    def save_report(
+        user_request: str, success: bool, result: str, token: dict, time_cost: dict, records: list, out_dir: Path
+    ):
+        report_lines: list[str] = []
 
-    #     # Header
-    #     report_lines.append("# Task Execution Report")
-    #     report_lines.append("")
+        # Header
+        report_lines.append("# Task Execution Report")
+        report_lines.append("")
 
-    #     # Part 1: Overall Summary
-    #     report_lines.append("## 1. Overall Summary")
-    #     report_lines.append("")
-    #     # User Request
-    #     report_lines.append("### User Request")
-    #     report_lines.append("")
-    #     report_lines.append(f"> {user_request.strip()}")
-    #     report_lines.append("")
-    #     # Success
-    #     report_lines.append("### Task Result")
-    #     report_lines.append(f"- **Success**: {'✅ Yes' if success else '❌ No'}")
-    #     report_lines.append(f"- **Result**: {result}")
-    #     report_lines.append("")
-    #     # Token usage
-    #     report_lines.append("### Token Usage")
-    #     report_lines.append("")
-    #     report_lines.append("| Model | Prompt Tokens | Completion Tokens | Total Tokens |")
-    #     report_lines.append("|------|---------------|-------------------|--------------|")
-    #     for model_name, t in token.items():
-    #         report_lines.append(
-    #             f"| {model_name} | {t.get('prompt_tokens', 0)} | "
-    #             f"{t.get('completion_tokens', 0)} | {t.get('total_tokens', 0)} |"
-    #         )
-    #     report_lines.append("")
-    #     # Time cost
-    #     report_lines.append("### Time Cost (seconds)")
-    #     report_lines.append("")
-    #     report_lines.append("| Type | Time |")
-    #     report_lines.append("|------|------|")
-    #     report_lines.append(f"| Total | {time_cost['total_time']} |")
-    #     report_lines.append(f"| Act | {time_cost['act_time']} |")
-    #     report_lines.append(f"| Observation | {time_cost['observation_time']} |")
-    #     report_lines.append(f"| Planning | {time_cost['planning_time']} |")
-    #     report_lines.append("")
+        # Part 1: Overall Summary
+        report_lines.append("## 1. Overall Summary")
+        report_lines.append("")
+        # User Request
+        report_lines.append("### User Request")
+        report_lines.append("")
+        report_lines.append(f"> {user_request.strip()}")
+        report_lines.append("")
+        # Success
+        report_lines.append("### Task Result")
+        report_lines.append(f"- **Success**: {'✅ Yes' if success else '❌ No'}")
+        report_lines.append(f"- **Result**: {result}")
+        report_lines.append("")
+        # Token usage
+        report_lines.append("### Token Usage")
+        report_lines.append("")
+        report_lines.append("| Model | Prompt Tokens | Completion Tokens | Total Tokens |")
+        report_lines.append("|------|---------------|-------------------|--------------|")
+        for model_name, t in token.items():
+            report_lines.append(
+                f"| {model_name} | {t.get('prompt_tokens', 0)} | "
+                f"{t.get('completion_tokens', 0)} | {t.get('total_tokens', 0)} |"
+            )
+        # Feedback
+        for record in reversed(records):
+            if record["type"] == "feedback":
+                report_lines.append("### Feedback")
+                report_lines.append("")
+                report_lines.append(record["feedback"])
+                break
 
-    #     # Part 2: Execution Records
-    #     report_lines.append("## 2. Execution Records")
-    #     report_lines.append("")
+        report_lines.append("")
+        # Time cost
+        counter = defaultdict(int)
+        for record in records:
+            counter[record["type"]] += 1
+        report_lines.append("### Time Cost (seconds)")
+        report_lines.append("")
+        report_lines.append("| Type | Time | Avg Time |")
+        report_lines.append("|------|------|---------|")
+        report_lines.append(
+            f"| Total | {time_cost['total_time']} | {time_cost['total_time'] / counter["planning"]:.4f} |"
+        )
+        for type_name in ("act", "observation", "planning", "extraction", "feedback"):
+            time_key = type_name + "_time"
+            report_lines.append(
+                f"| {type_name.title()} | {time_cost[time_key]} | {time_cost[time_key] / counter[type_name]:.4f} |"
+            )
+        report_lines.append("")
 
-    #     for idx, record in enumerate(records, start=1):
-    #         record_type = record["type"]
-    #         token_usage = record["token_usage"]
-    #         # Act Record
-    #         if record_type == "act":
-    #             report_lines.append(f"### {idx}. Act")
-    #             report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-    #             report_lines.append(
-    #                 f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
-    #             )
-    #             report_lines.append("")
-    #             report_lines.append("**Actions:**")
-    #             for action_idx, action in enumerate(record["actions"], start=1):
-    #                 success_flag = "✅" if action["success"] else "❌"
-    #                 report_lines.append(f"{action_idx}. **Action {action_idx}**")
-    #                 report_lines.append(f"    - **Raw**: {action['raw']}")
-    #                 report_lines.append(f"    - **Description**: {action['description']}")
-    #                 report_lines.append(f"    - **Success**: {success_flag}")
-    #                 if action.get("additional") is not None:
-    #                     report_lines.append(f"    - **Additional**: {action['additional']}")
+        # Part 2: Execution Records
+        report_lines.append("## 2. Execution Records")
+        report_lines.append("")
 
-    #                 # 并排显示截图
-    #                 action_img = f"![Action]({action['action_screenshot_name']})"
-    #                 result_img = f"![Result]({action['result_screenshot_name']})" if action["success"] else ""
-    #                 if action["success"]:
-    #                     # 使用 HTML 表格并排
-    #                     img_html = f"<table><tr><td>{action_img}</td><td>{result_img}</td></tr></table>"
-    #                     report_lines.append(f"    - **Screenshots**: {img_html}")
-    #                 else:
-    #                     report_lines.append(f"    - **Action Screenshot**: {action_img}")
+        for idx, record in enumerate(records, start=1):
+            record_type = record["type"]
+            token_usage = record["token_usage"]
+            # Act Record
+            if record_type == "act":
+                report_lines.append(f"### {idx}. Act")
+                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                )
+                report_lines.append("")
+                report_lines.append("**Actions:**")
+                for action_idx, action in enumerate(record["actions"], start=1):
+                    success_flag = "✅" if action["success"] else "❌"
+                    report_lines.append(f"{action_idx}. **Action {action_idx}**")
+                    report_lines.append(f"    - **Raw**: {action['raw']}")
+                    report_lines.append(f"    - **Description**: {action['description']}")
+                    report_lines.append(f"    - **Success**: {success_flag}")
+                    if action.get("result") is not None:
+                        report_lines.append(f"    - **Result**: {action['result']}")
 
-    #             report_lines.append("")
-    #         # Observation Record
-    #         elif record_type == "observation":
-    #             report_lines.append(f"### {idx}. Observation")
-    #             report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-    #             report_lines.append(
-    #                 f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
-    #             )
-    #             report_lines.append("")
-    #             report_lines.append("**Observation**:")
-    #             report_lines.append(record["observation"])
-    #             report_lines.append("")
-    #         # Planning Record
-    #         elif record_type == "planning":
-    #             report_lines.append(f"### {idx}. Planning")
-    #             report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-    #             report_lines.append(
-    #                 f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
-    #             )
-    #             report_lines.append(f"- **Task Completed**: {record['task_completed']}")
-    #             report_lines.append("")
+                    # 并排显示截图
+                    action_img = f"![Action]({action['action_screenshot_name']})"
+                    result_img = f"![Result]({action['result_screenshot_name']})" if action["success"] else ""
+                    if action["success"]:
+                        # 使用 HTML 表格并排
+                        img_html = f"<table><tr><td>{action_img}</td><td>{result_img}</td></tr></table>"
+                        report_lines.append(f"    - **Screenshots**: {img_html}")
+                    else:
+                        report_lines.append(f"    - **Action Screenshot**: {action_img}")
 
-    #             if record["task_completed"]:
-    #                 report_lines.append("**Task Result:**")
-    #                 report_lines.append(record.get("task_result", ""))
-    #             else:
-    #                 report_lines.append("**Current State:**")
-    #                 report_lines.append(record.get("current_state", ""))
-    #             report_lines.append("")
+                report_lines.append("")
+            # Observation Record
+            elif record_type == "observation":
+                report_lines.append(f"### {idx}. Observation")
+                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                )
+                report_lines.append("")
+                report_lines.append("**Observation**:")
+                report_lines.append(record["observation"])
+                report_lines.append("")
+            # Planning Record
+            elif record_type == "planning":
+                report_lines.append(f"### {idx}. Planning")
+                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                )
+                report_lines.append(f"- **Task Completed**: {record['task_completed']}")
+                report_lines.append("")
 
-    #             if not record["task_completed"]:
-    #                 report_lines.append("**New Progress:**")
-    #                 report_lines.append(record.get("new_progress", ""))
-    #                 report_lines.append("")
+                report_lines.append("**New Progress:**")
+                report_lines.append(record.get("new_progress", ""))
+                report_lines.append("")
 
-    #                 report_lines.append("**Nearest Next Objective:**")
-    #                 report_lines.append(record.get("nearest_next_objective", ""))
-    #                 report_lines.append("")
+                report_lines.append("**Requested Data Found:**")
+                report_lines.append(record.get("requested_data_found", ""))
+                report_lines.append("")
 
-    #                 report_lines.append("")
-    #                 report_lines.append("**Unfinished Content:**")
-    #                 report_lines.append(record.get("unfinished_content", ""))
-    #                 report_lines.append("")
-    #             report_lines.append("")
+                report_lines.append("**Task State:**")
+                report_lines.append(record.get("task_state", ""))
+                report_lines.append("")
 
-    #     # Write md file
-    #     report_path = out_dir / "report.md"
-    #     with open(report_path, "w", encoding="utf-8") as f:
-    #         f.write("\n".join(report_lines))
-    #     logger.info("Report saved to {}", report_path)
+                report_lines.append("")
+                report_lines.append("**Act Goal:**")
+                report_lines.append(record.get("act_goal", ""))
+                report_lines.append("")
+                report_lines.append("")
+            # Feedback Record
+            elif record_type == "feedback":
+                report_lines.append(f"### {idx}. Feedback")
+                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                )
+                report_lines.append("")
+                report_lines.append("**Feedback**:")
+                report_lines.append(record["feedback"])
+                report_lines.append("")
+            # Extraction Record
+            elif record_type == "extraction":
+                report_lines.append(f"### {idx}. Extraction")
+                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                )
+                report_lines.append("")
+                report_lines.append("**Extraction**:")
+                report_lines.append(record["data"])
+                report_lines.append("")
+
+        # Write md file
+        report_path = out_dir / "report.md"
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines))
+        logger.info("Report saved to {}", report_path)

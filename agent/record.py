@@ -32,6 +32,12 @@ class TimeLine:
     def total_time(self) -> float:
         return self.content[-1][1] - self.content[0][1]
 
+    def to_dict(self) -> dict:
+        return {
+            "total_time": self.total_time(),
+            "time_points": self.content.copy(),
+        }
+
 
 @dataclass
 class PlanningRecord(Record):
@@ -54,7 +60,7 @@ class PlanningRecord(Record):
                 "task_state": self.task_state,
                 "act_goal": self.act_goal,
                 "task_completed": self.task_completed,
-                "time_line": self.time_line.content,
+                "time_line": self.time_line.to_dict(),
             },
         )
 
@@ -72,7 +78,7 @@ class ExtractionRecord(Record):
             {
                 "llm_details": self.llm_details,
                 "data": self.data,
-                "time_line": self.time_line.content,
+                "time_line": self.time_line.to_dict(),
             },
         )
 
@@ -90,7 +96,7 @@ class FeedbackRecord(Record):
             {
                 "llm_details": self.llm_details,
                 "feedback": self.feedback,
-                "time_line": self.time_line.content,
+                "time_line": self.time_line.to_dict(),
             },
         )
 
@@ -124,7 +130,7 @@ class ActRecord(Record):
             "act",
             {
                 "action_details_list": [a.to_dict() for a in self.action_details_list],
-                "time_line": self.time_line.content,
+                "time_line": self.time_line.to_dict(),
                 "llm_details": self.llm_details,
                 "interactive_nodes_repr": self.interactive_nodes_repr,
                 "act_goal": self.act_goal,
@@ -145,6 +151,6 @@ class ObservationRecord(Record):
             {
                 "llm_details": self.llm_details,
                 "observation": self.observation,
-                "time_line": self.time_line.content,
+                "time_line": self.time_line.to_dict(),
             },
         )
