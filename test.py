@@ -44,7 +44,7 @@ if __name__ == "__main__":
     asyncio.run(
         run_agent(
             out_dir=Path("output/test"),
-            task="Find the store location and Business Hours of the closest Trader Joe's to zip code 90028 and set it as my home store.",
-            start_url="https://www.traderjoes.com/",
+            task="找到star数量最高的和自动化相关的仓库，告诉我仓库的名称、地址和star数量",
+            start_url="https://github.com/",
         )
     )

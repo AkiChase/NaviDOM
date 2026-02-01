@@ -32,7 +32,7 @@ Update the TODO List so that it:
 - Do not include internal reasoning or chain-of-thought; only show the TODO list and essential explanations.
 
 ## Output Format
-1. [STATUS] Short task title
+1. <STATUS>: Short task title
    - Description in one short sentences
    - If relevant data is expected: concise relevant data
 2. ...

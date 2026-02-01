@@ -88,9 +88,8 @@ class Agent:
         else:
             # 初次导航
             before_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
-            before_act_tabs_info = await self.tab_manager.get_tabs_info()
             await self.act_initial()
-            await self.observation(before_act_screenshot, before_act_tabs_info)
+            await self.observation(before_act_screenshot)
 
         # 初次规划
         extraction_task = await self.planning()
@@ -98,22 +97,10 @@ class Agent:
         iteration_times = 0
         while True:
             iteration_times += 1
-
-            before_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
-            before_act_tabs_info = await self.tab_manager.get_tabs_info()
-            # Act
-            await self.act()
-            # Observation
-            await self.observation(before_act_screenshot, before_act_tabs_info)
-            # Planning
-            await extraction_task  # ensure extraction_task (of last planning) is done before next planning
-            extraction_task = await self.planning()
-
             assert self.last_planning_record is not None
             if self.last_planning_record.task_completed:
-                # ensure extraction_task is done
+                # ensure extraction and feedback task is done
                 feedback_task = await extraction_task
-                # ensure feedback_task is done
                 await feedback_task
 
                 assert self.last_feedback_record is not None
@@ -123,18 +110,31 @@ class Agent:
                 else:
                     logger.warning(f"[Feedback] Task not completed, restart planning")
                     extraction_task = await self.planning()
+                    if self.last_planning_record.task_completed:
+                        feedback_task = await extraction_task
+                        await feedback_task
+                        logger.success(f"[Planning] Task completed")
+                        break
 
-
-            if iteration_times >= Config.max_iteration_times:
-                # ensure extraction_task is done
+            if iteration_times > Config.max_iteration_times:
+                # ensure extraction and feedback task is done
                 feedback_task = await extraction_task
-                # ensure feedback_task is done
                 await feedback_task
 
                 logger.warning(
                     f"[Planning] Max iteration times reached, stop: {iteration_times}/{Config.max_iteration_times}"
                 )
                 break
+
+            before_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
+            # Act
+            await self.act()
+            # Observation
+            await self.observation(before_act_screenshot)
+            # Planning
+            await extraction_task  # ensure extraction task (of last planning) is done before next planning
+            extraction_task = await self.planning()
+
 
         end_time = datetime.now()
         logger.info(f"[Time] Total time cost: {format_time_delta(start_time, end_time)}")
@@ -359,7 +359,7 @@ class Agent:
         assert isinstance(extraction_task, asyncio.Task), "Failed to create extraction data task"
         return extraction_task
 
-    async def observation(self, before_act_screenshot: Image.Image, before_act_tabs_info: str):
+    async def observation(self, before_act_screenshot: Image.Image):
         time_line = TimeLine()
         record_index = len(self.records)
         self.records.append(Record(record_index))

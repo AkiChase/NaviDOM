@@ -25,7 +25,7 @@ class ActionType(Enum):
     Click = "CLICK"
     Input = "INPUT"
     Scroll = "SCROLL"
-    Press = "PRESS"
+    # Press = "PRESS"
     TabSwitch = "TAB_SWITCH"
     TabClose = "TAB_CLOSE"
     Navigate = "NAVIGATE"
@@ -38,7 +38,7 @@ action_format_prompt = {
     ActionType.Click: "CLICK, <node_id>",
     ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// Focus and input <text> into the specified input or textarea node. In <text>, only \\n has special meaning for line breaks; no other escaping is required",
     ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>. Minimum scroll increment is 0.1 pages",
-    ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
+    # ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to the specified tab making it the active and visible tab",
     ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
     ActionType.Navigate: "NAVIGATE, <url>\t// Navigate to the specified URL",
@@ -126,11 +126,11 @@ class Action:
             assert direction in ("up", "down"), ActionParseException(f"Invalid scroll direction: {direction}")
             pages = float(sub_parts[1])
             return Action(uid, action_type, None, {"direction": direction, "pages": pages})
-        elif action_type == ActionType.Press:
-            # PRESS, <KeyboardEvent.key>
-            assert len(parts) == 2, ActionParseException(f"Invalid PRESS format: {raw_action}")
-            key = parts[1]
-            return Action(uid, action_type, None, {"key": key})
+        # elif action_type == ActionType.Press:
+        #     # PRESS, <KeyboardEvent.key>
+        #     assert len(parts) == 2, ActionParseException(f"Invalid PRESS format: {raw_action}")
+        #     key = parts[1]
+        #     return Action(uid, action_type, None, {"key": key})
         elif action_type == ActionType.Navigate:
             # NAVIGATE, <url>
             assert len(parts) == 2, ActionParseException(f"Invalid NAVIGATE format: {raw_action}")
@@ -201,6 +201,7 @@ class Action:
                         await loc.fill(text, timeout=5000)
                     else:
                         await loc.type(text, timeout=5000)
+                    await loc.press("Enter")
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
                 await asyncio.sleep(1.5)
@@ -212,10 +213,10 @@ class Action:
                 dy = -dy
             await tab.evaluate(f"window.scrollBy(0, {dy});")
             await asyncio.sleep(1)
-        elif self.type == ActionType.Press:
-            key = self.extra["key"]
-            await tab.keyboard.press(key)
-            await asyncio.sleep(1)
+        # elif self.type == ActionType.Press:
+        #     key = self.extra["key"]
+        #     await tab.keyboard.press(key)
+        #     await asyncio.sleep(1)
         elif self.type == ActionType.Navigate:
             url = self.extra["url"]
             await tab.goto(url)
