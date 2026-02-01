@@ -4,7 +4,7 @@ Your responsibility is to update the task progress and decide the next concrete 
 ## You are given
 - User Request: the overall task objective the user wants to accomplish.
 - Progress History: the full progress history of the agent so far, including: Previous recorded Progress and relevant user-requested Data
-- Last Planning: the output of the previous Planning step, including: Task State and Act Goal
+- Last Planning: the output of the previous Planning step, including: Task State and Act Goal.
 - Last Act: A factual description of the actions that were performed and their execution results (e.g., changed tab information, error messages).
 - Last Act Observation: A concise observation of the Act result by Observation Agent, including: observable UI result of the Act; whether the last Act Goal was achieved; any notable constraints or cautions for future actions
 - Current Tabs: A list describing all currently open browser tabs. Each item is a single-line string: <tab_id>. **Visible/Background** <title> <url>
@@ -30,12 +30,11 @@ The output should contain the following sections:
 - If not found, use: [NOT_FOUND] no new data compared to Progress History
 
 ### Task State
-- A one-sentence summary of the current overall task completion status, including what is still missing or unfinished. Example: The task is partially complete; the profile page has been accessed, but the user's subscription details are still missing.
-- If the task is fully complete, use: TASK_FULLY_FINISHED
+- A one-sentence summary of the current overall task completion status, explicitly stating either what remains unfinished or that the task is fully completed with nothing missing. Example: The task is partially complete; the profile page has been accessed, but the user's subscription details are still missing.
 
 ### Act Goal
 - A one-sentence, UI-grounded goal describing the next step the Act Agent should take to achieve a clear objective. The goal must: State the purpose and actionable steps that are directly executable and sequentially feasible, including clicking elements, inputing text, pressing keys, scrolling the page, navigating to URL, or switching/closing tabs. Example: Click the "Subscription" tab on the profile page to view the user's subscription details.
-- If the task is fully complete, use: TASK_FULLY_FINISHED
+- If the Task State indicates that the task is fully complete, use: TASK_FULLY_FINISHED
 
 ## Output format
 You must output the sections in the following format strictly:
@@ -52,8 +51,7 @@ Act Goal: one-sentence actionable next step with clear objective or TASK_FULLY_F
 {progress_history}
 
 **Last Planning**:
-- Task State: {last_task_state}
-- Act Goal: {last_act_goal}
+{last_planning}
 
 **Last Act**:
 {last_act}

@@ -106,19 +106,31 @@ class Agent:
             # Observation
             await self.observation(before_act_screenshot, before_act_tabs_info)
             # Planning
-            await extraction_task  # ensure extraction_task is done before planning
+            await extraction_task  # ensure extraction_task (of last planning) is done before next planning
             extraction_task = await self.planning()
 
             assert self.last_planning_record is not None
             if self.last_planning_record.task_completed:
                 # ensure extraction_task is done
                 feedback_task = await extraction_task
-                if feedback_task is not None:
-                    await feedback_task
-                logger.success(f"[Planning] Task completed")
-                break
+                # ensure feedback_task is done
+                await feedback_task
+
+                assert self.last_feedback_record is not None
+                if self.last_feedback_record.all_done:
+                    logger.success(f"[Planning] Task completed")
+                    break
+                else:
+                    logger.warning(f"[Feedback] Task not completed, restart planning")
+                    extraction_task = await self.planning()
+
 
             if iteration_times >= Config.max_iteration_times:
+                # ensure extraction_task is done
+                feedback_task = await extraction_task
+                # ensure feedback_task is done
+                await feedback_task
+
                 logger.warning(
                     f"[Planning] Max iteration times reached, stop: {iteration_times}/{Config.max_iteration_times}"
                 )
@@ -130,7 +142,7 @@ class Agent:
             f"[Time] Per act time cost: {(end_time - start_time).total_seconds() / len([r for r in self.records if isinstance(r, ActRecord)]):.2f}s"
         )
         if self.last_feedback_record is not None:
-            logger.info(f"[Feedback]:\n{self.last_feedback_record.feedback}")
+            logger.info(f"[Feedback]:\n{self.last_feedback_record.repr}")
         out = self.save_result((end_time - start_time).total_seconds())
         self.save_report(**out, out_dir=self.out_dir)
 
@@ -163,29 +175,36 @@ class Agent:
         else:
             last_todo_list = self.last_feedback_record.feedback
 
-        if self.last_planning_record is None:
-            task_state = "No task state currently."
-        else:
-            task_state = self.last_planning_record.task_state
-
         prompt = self.prompts_dict["feedback"].format(
             user_request=self.user_request,
             last_todo_list=last_todo_list,
             agent_history=self.get_formated_progress_history(),
-            task_state=task_state,
         )
         llm_detail = await SecondaryLLM.chat_with_text_detail(prompt)
-        content = llm_detail["content"]
-        logger.info(f"[Feedback] Detail:\n{content}")
+        content = "\n".join(line for line in llm_detail["content"].splitlines() if line.strip())
+        all_done = content.find("IN PROGRESS") == -1 and content.find("NOT STARTED") == -1
+        repr = content
+        status_emoji = {
+            "DONE": "✅",
+            "IN PROGRESS": "⏳",
+            "NOT STARTED": "🔴",
+        }
+        for k, v in status_emoji.items():
+            repr = repr.replace(k, f"{v} {k}")
+
+        logger.info(f"[Feedback] Detail:\n{repr}")
         time_line.add("llm")
 
         record = FeedbackRecord(
             index=record_index,
             llm_details=llm_detail,
             feedback=content,
+            repr=repr,
+            all_done=all_done,
             time_line=time_line,
         )
         self.records[record_index] = record
+        self.last_feedback_record = record
 
     async def extraction(self, new_progress: str, req_data_found: str) -> asyncio.Task[None] | None:
         if req_data_found.find("[FOUND]") != -1:
@@ -219,16 +238,15 @@ class Agent:
                 time_line=time_line,
             )
             self.records[record_index] = record
-
-            feed_back_task = asyncio.create_task(self.feedback())
-            return feed_back_task
         elif req_data_found.find("[NOT_FOUND]") != -1:
             logger.debug(f"[Extraction] No new data")
         else:
             logger.error(f"[Extraction] Invalid Requested Data Found format: {req_data_found}")
-        return None
 
-    async def planning(self) -> asyncio.Task[asyncio.Task[None] | None]:
+        feed_back_task = asyncio.create_task(self.feedback())
+        return feed_back_task
+
+    async def planning(self) -> asyncio.Task[asyncio.Task[None]]:
         time_line = TimeLine()
         record_index = len(self.records)
         self.records.append(Record(record_index))
@@ -238,9 +256,20 @@ class Agent:
         if self.last_planning_record is None:
             last_task_state = "The first Planning. No Last Task State."
             last_act_goal = "The first Planning. No Last Act Goal."
+            last_planning = f"- Task State: {last_task_state}\n- Act Goal: {last_act_goal}"
         else:
-            last_task_state = self.last_planning_record.task_state
-            last_act_goal = self.last_planning_record.act_goal
+            if self.last_planning_record.task_completed:
+                assert self.last_feedback_record is not None
+                last_planning = (
+                    "Previous Planning step concluded that the task (User Request) was fully finished, "
+                    "but the Feedback Agent noted that some parts of the User Request are still incomplete. "
+                    "Please consider the Feedback Agent's comments:\n"
+                    f"{self.last_feedback_record.feedback}"
+                )
+            else:
+                last_task_state = self.last_planning_record.task_state
+                last_act_goal = self.last_planning_record.act_goal
+                last_planning = f"- Task State: {last_task_state}\n- Act Goal: {last_act_goal}"
 
         if self.last_act_record is None:
             last_act = "Navigate to the initial page (See Current Tabs for details)."
@@ -263,8 +292,7 @@ class Agent:
         prompt = self.prompts_dict["planning"].format(
             user_request=self.user_request,
             progress_history="No entries.",
-            last_task_state=last_task_state,
-            last_act_goal=last_act_goal,
+            last_planning=last_planning,
             last_act=last_act,
             last_act_observation=last_act_observation,
             current_tabs=current_tabs,
@@ -306,7 +334,7 @@ class Agent:
         assert requested_data_found is not None, "Failed to parse expected Requested Data Found in LLM response"
         assert task_state is not None, "Failed to parse expected Task State in LLM response"
         assert act_goal is not None, "Failed to parse expected Act Goal in LLM response"
-        task_completed = "TASK_FULLY_FINISHED" in task_state and "TASK_FULLY_FINISHED" in act_goal
+        task_completed = "TASK_FULLY_FINISHED" in task_state or "TASK_FULLY_FINISHED" in act_goal
 
         logger.debug(f"[New Progress] {new_progress}")
         logger.debug(f"[Requested Data Found] {requested_data_found}")
@@ -810,7 +838,7 @@ User Request:
                 records.append(
                     {
                         "type": "feedback",
-                        "feedback": record.feedback,
+                        "feedback": record.repr,
                         "time_cost": round(record.time_line.total_time(), 4),
                         "token_usage": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
@@ -894,6 +922,7 @@ User Request:
                 f"| {model_name} | {t.get('prompt_tokens', 0)} | "
                 f"{t.get('completion_tokens', 0)} | {t.get('total_tokens', 0)} |"
             )
+        report_lines.append("")
         # Feedback
         for record in reversed(records):
             if record["type"] == "feedback":
@@ -915,14 +944,24 @@ User Request:
             f"| Total | {time_cost['total_time']} | {time_cost['total_time'] / counter["planning"]:.4f} |"
         )
         for type_name in ("act", "observation", "planning", "extraction", "feedback"):
+            if counter[type_name] == 0:
+                continue
             time_key = type_name + "_time"
             report_lines.append(
                 f"| {type_name.title()} | {time_cost[time_key]} | {time_cost[time_key] / counter[type_name]:.4f} |"
             )
         report_lines.append("")
 
-        # Part 2: Execution Records
-        report_lines.append("## 2. Execution Records")
+        # Part 2: Progress History
+        report_lines.append("## 2. Progress History")
+        report_lines.append("")
+        for record in records:
+            if record["type"] == "planning":
+                report_lines.append(f"- {record.get('new_progress', '')}")
+        report_lines.append("")
+
+        # Part 3: Execution Records
+        report_lines.append("## 3. Execution Records")
         report_lines.append("")
 
         for idx, record in enumerate(records, start=1):

@@ -87,6 +87,8 @@ class ExtractionRecord(Record):
 class FeedbackRecord(Record):
     llm_details: ChatTextDetails
     feedback: str
+    repr: str
+    all_done: bool
     time_line: TimeLine
 
     def save(self, out_dir: Path):
