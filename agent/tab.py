@@ -70,12 +70,19 @@ class TabManager:
         return "\n".join(tabs_info)
 
     async def get_cur_tab_info(self) -> dict:
-        front_tab = self.front_tab
-        return {
-            "tab_id": self.cur_tab_id,
-            "title": await front_tab.title(),
-            "url": front_tab.url,
-        }
+        for _ in range(10):
+            try:
+                front_tab = self.front_tab
+                await front_tab.wait_for_load_state("load")
+                return {
+                    "tab_id": self.cur_tab_id,
+                    "title": await front_tab.title(),
+                    "url": front_tab.url,
+                }
+            except Exception as e:
+                logger.warning(f"[TabManager] Failed to get tab info, error: {e}")
+                await asyncio.sleep(0.5)
+        raise RuntimeError("Failed to get tab info after 10 retries.")
 
     @staticmethod
     def compare_tab_info(new_tab_info: dict, old_tab_info: dict) -> str | None:

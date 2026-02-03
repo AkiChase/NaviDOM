@@ -7,15 +7,6 @@ from agent.action import ActionDetails
 from agent.llm import ChatImageDetails, ChatImageListDetails, ChatTextDetails
 
 
-@dataclass
-class Record:
-    index: int
-
-    def save(self, out_dir: Path, name: str, data: dict):
-        with open(out_dir / f"{self.index:03}_{name}.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-
-
 class TimeLine:
     content: list[tuple[str, float]]
 
@@ -32,11 +23,24 @@ class TimeLine:
     def total_time(self) -> float:
         return self.content[-1][1] - self.content[0][1]
 
+    def endpoint(self) -> tuple[float, float]:
+        return (self.content[0][1], self.content[-1][1])
+
     def to_dict(self) -> dict:
         return {
             "total_time": self.total_time(),
             "time_points": self.content.copy(),
         }
+
+
+@dataclass
+class Record:
+    index: int
+    time_line: TimeLine
+
+    def save(self, out_dir: Path, name: str, data: dict):
+        with open(out_dir / f"{self.index:03}_{name}.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
 
 
 @dataclass
@@ -47,7 +51,7 @@ class PlanningRecord(Record):
     task_state: str
     act_goal: str
     task_completed: bool
-    time_line: TimeLine
+    screenshot_path: Path
 
     def save(self, out_dir: Path):
         super().save(
@@ -60,6 +64,7 @@ class PlanningRecord(Record):
                 "task_state": self.task_state,
                 "act_goal": self.act_goal,
                 "task_completed": self.task_completed,
+                "screenshot_path": str(self.screenshot_path),
                 "time_line": self.time_line.to_dict(),
             },
         )
@@ -69,7 +74,6 @@ class PlanningRecord(Record):
 class ExtractionRecord(Record):
     llm_details: ChatImageDetails
     data: str
-    time_line: TimeLine
 
     def save(self, out_dir: Path):
         super().save(
@@ -89,7 +93,6 @@ class FeedbackRecord(Record):
     feedback: str
     repr: str
     all_done: bool
-    time_line: TimeLine
 
     def save(self, out_dir: Path):
         super().save(
@@ -106,8 +109,9 @@ class FeedbackRecord(Record):
 @dataclass
 class ActRecord(Record):
     action_details_list: list[ActionDetails]
-    time_line: TimeLine
     llm_details: ChatImageDetails | ChatTextDetails
+    pruning_time: float
+    pruning_tokens: tuple[int, int, str]
     interactive_nodes_repr: str
     act_goal: str
 
@@ -134,6 +138,12 @@ class ActRecord(Record):
                 "action_details_list": [a.to_dict() for a in self.action_details_list],
                 "time_line": self.time_line.to_dict(),
                 "llm_details": self.llm_details,
+                "pruning_time": self.pruning_time,
+                "pruning_tokens": {
+                    "prompt_tokens": self.pruning_tokens[0],
+                    "completion_tokens": self.pruning_tokens[1],
+                    "model": self.pruning_tokens[2],
+                },
                 "interactive_nodes_repr": self.interactive_nodes_repr,
                 "act_goal": self.act_goal,
             },
@@ -142,9 +152,8 @@ class ActRecord(Record):
 
 @dataclass
 class ObservationRecord(Record):
-    llm_details: ChatImageListDetails | None
+    llm_details: ChatImageListDetails
     observation: str
-    time_line: TimeLine
 
     def save(self, out_dir: Path):
         super().save(

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 from loguru import logger
+from matplotlib import pyplot as plt
 from playwright.async_api import BrowserContext
 from PIL import ImageFont, ImageDraw, Image
 
@@ -19,7 +20,7 @@ from agent.action import (
 )
 from agent.config import Config
 from agent.dom import DomCluster, DomNode, DomState, Viewport
-from agent.llm import PrimaryLLM, SecondaryLLM
+from agent.llm import ChatImageDetails, PrimaryLLM, SecondaryLLM
 from agent.record import (
     ActRecord,
     ExtractionRecord,
@@ -108,7 +109,7 @@ class Agent:
                     logger.success(f"[Planning] Task completed")
                     break
                 else:
-                    logger.warning(f"[Feedback] Task not completed, restart planning")
+                    logger.warning(f"[Feedback] Task not completed")
                     extraction_task = await self.planning()
                     if self.last_planning_record.task_completed:
                         feedback_task = await extraction_task
@@ -122,7 +123,7 @@ class Agent:
                 await feedback_task
 
                 logger.warning(
-                    f"[Planning] Max iteration times reached, stop: {iteration_times}/{Config.max_iteration_times}"
+                    f"[Planning] Max iteration times reached, stop: {iteration_times-1}/{Config.max_iteration_times}"
                 )
                 break
 
@@ -133,8 +134,8 @@ class Agent:
             await self.observation(before_act_screenshot)
             # Planning
             await extraction_task  # ensure extraction task (of last planning) is done before next planning
+            # TODO 如果progress过长（token达到某个阈值？）后可以在背景任务中提取有效、去除重复（相对user request)的progress（记录旧的长度，提取成功后，将旧的那几条替换成新的）
             extraction_task = await self.planning()
-
 
         end_time = datetime.now()
         logger.info(f"[Time] Total time cost: {format_time_delta(start_time, end_time)}")
@@ -167,7 +168,7 @@ class Agent:
     async def feedback(self):
         time_line = TimeLine()
         record_index = len(self.records)
-        self.records.append(Record(record_index))
+        self.records.append(Record(record_index, time_line))
         logger.info(f"[{record_index:03}] Feedback")
 
         if self.last_feedback_record is None:
@@ -203,6 +204,7 @@ class Agent:
             all_done=all_done,
             time_line=time_line,
         )
+        record.save(self.out_dir)
         self.records[record_index] = record
         self.last_feedback_record = record
 
@@ -210,7 +212,7 @@ class Agent:
         if req_data_found.find("[FOUND]") != -1:
             time_line = TimeLine()
             record_index = len(self.records)
-            self.records.append(Record(record_index))
+            self.records.append(Record(record_index, time_line))
             logger.info(f"[{record_index:03}] Extraction")
 
             cur_tab = self.tab_manager.front_tab
@@ -237,6 +239,7 @@ class Agent:
                 data=content,
                 time_line=time_line,
             )
+            record.save(self.out_dir)
             self.records[record_index] = record
         elif req_data_found.find("[NOT_FOUND]") != -1:
             logger.debug(f"[Extraction] No new data")
@@ -249,7 +252,7 @@ class Agent:
     async def planning(self) -> asyncio.Task[asyncio.Task[None]]:
         time_line = TimeLine()
         record_index = len(self.records)
-        self.records.append(Record(record_index))
+        self.records.append(Record(record_index, time_line))
         record_prefix = f"{record_index:03}_planning"
         logger.info(f"[{record_index:03}] Planning")
 
@@ -314,12 +317,16 @@ class Agent:
             )
             if new_progress is None or requested_data_found is None:
                 return
+            logger.debug(f"[Planning][New Progress] {new_progress}")
+            self.progress.append(content)
+            logger.debug(f"[Planning][Requested Data Found] {requested_data_found}")
             extraction_task = asyncio.create_task(self.extraction(new_progress, requested_data_found))
 
         final_screenshot = screenshot.resize(
             (int(screenshot.width * 0.75), int(screenshot.height * 0.75)), resample=Image.Resampling.LANCZOS
         )
-        final_screenshot.save(self.out_dir / f"{record_prefix}.jpg")
+        final_screenshot_path = self.out_dir / f"{record_prefix}.jpg"
+        final_screenshot.save(final_screenshot_path)
         llm_details = await PrimaryLLM.chat_with_image_detail(
             prompt, final_screenshot, hook=hook_extraction_and_feedback
         )
@@ -336,10 +343,8 @@ class Agent:
         assert act_goal is not None, "Failed to parse expected Act Goal in LLM response"
         task_completed = "TASK_FULLY_FINISHED" in task_state or "TASK_FULLY_FINISHED" in act_goal
 
-        logger.debug(f"[New Progress] {new_progress}")
-        logger.debug(f"[Requested Data Found] {requested_data_found}")
-        logger.debug(f"[Task State] {task_state}")
-        logger.debug(f"[Act Goal] {act_goal}")
+        logger.debug(f"[Planning][Task State] {task_state}")
+        logger.debug(f"[Planning][Act Goal] {act_goal}")
 
         time_line.add("end")
         record = PlanningRecord(
@@ -350,6 +355,7 @@ class Agent:
             task_state=task_state,
             act_goal=act_goal,
             task_completed=task_completed,
+            screenshot_path=final_screenshot_path,
             time_line=time_line,
         )
         record.save(self.out_dir)
@@ -362,7 +368,7 @@ class Agent:
     async def observation(self, before_act_screenshot: Image.Image):
         time_line = TimeLine()
         record_index = len(self.records)
-        self.records.append(Record(record_index))
+        self.records.append(Record(record_index, time_line))
         assert self.last_act_record is not None
         logger.info(f"[{record_index:03}] Observation")
 
@@ -383,7 +389,7 @@ class Agent:
             prompt, [before_act_screenshot, after_act_screenshot]
         )
         observation = llm_details["content"]
-        logger.debug(f"[Result] {llm_details['content']}")
+        logger.debug(f"[Observation] {llm_details['content']}")
         time_line.add("llm")
 
         time_line.add("end")
@@ -419,7 +425,7 @@ User Request:
 
         time_line = TimeLine()
         record_index = len(self.records)
-        self.records.append(Record(record_index))
+        self.records.append(Record(record_index, time_line))
         action_index = 1
         action_uid = gen_uid()
         record_prefix = f"{record_index:03}_act"
@@ -432,7 +438,7 @@ User Request:
         action = Action.from_raw_action(
             uid=action_uid, raw_action=raw_action, dom_nodes=[], tab_manager=self.tab_manager
         )
-        logger.debug(f"[Action] Construct 1 action: [{action.type.name}]")
+        logger.debug(f"[Act] Construct 1 action: [{action.type.name}]")
 
         action_screenshot = await tab_screenshot(cur_tab)
         action_screenshot_draw = ImageDraw.Draw(action_screenshot)
@@ -463,6 +469,8 @@ User Request:
         record = ActRecord(
             index=record_index,
             action_details_list=[action_details],
+            pruning_time=0,
+            pruning_tokens=(0, 0, SecondaryLLM.image_model),
             time_line=time_line,
             llm_details=llm_details,
             interactive_nodes_repr="",
@@ -474,10 +482,10 @@ User Request:
 
     async def act(self):
         record_index = len(self.records)
-        self.records.append(Record(record_index))
+        time_line = TimeLine()
+        self.records.append(Record(record_index, time_line))
         record_prefix = f"{record_index:03}_act"
         cur_tab = self.tab_manager.front_tab
-        time_line = TimeLine()
         logger.info(f"[{record_index:03}] Act")
 
         assert self.last_planning_record is not None
@@ -518,12 +526,17 @@ User Request:
 
         # 基于语义对元素进行剪枝
         # 空间聚类， alpha 高时以像素坐标的距离为主；alpha 低时以DOM结构的距离为主
-        clusters = DomCluster.cluster_construct(interactive_nodes, alpha=0.45, distance_threshold=0.4)
-        assert len(clusters) >= 1
-        if len(clusters) == 1:
-            logger.warning("[Cluster] Only one cluster, fallback to no pruning")
-        else:
-            logger.debug("[Cluster] Cluster count: {}", len(clusters))
+        # 筛除尺寸过小的无效聚类
+        clusters: list[list[DomNode]] = []
+        for c in DomCluster.cluster_construct(interactive_nodes, alpha=0.45, distance_threshold=0.45):
+            rect = DomCluster.cluster_covered_xyxy(c)
+            w, h = rect[2] - rect[0], rect[3] - rect[1]
+            if w <= 2.5 or h <= 2.5:
+                continue
+            clusters.append(c)
+
+        assert len(clusters) >= 1, "No valid cluster found"
+        logger.debug("[Act][Cluster] Cluster count: {}", len(clusters))
         time_line.add("cluster")
 
         if Config.debug:
@@ -579,13 +592,13 @@ User Request:
             if Config.debug:
                 cluster_region.save(self.out_dir / f"{record_prefix}_debug_4_cluster_{index + 1}.jpg")
             related_tasks.append(DomCluster.determine_cluster_related(cluster, cluster_region, task=act_goal))
-        related_tasks_res = await asyncio.gather(*related_tasks)
+        related_tasks_res: list[tuple[bool, ChatImageDetails]] = await asyncio.gather(*related_tasks)
         related_cluster = [
             (cluster, rect) for (flag, _), cluster, rect in zip(related_tasks_res, clusters, related_rects) if flag
         ]
         flags = [flag for flag, _ in related_tasks_res]
         logger.debug(
-            f"[Pruning] Related {len(related_cluster)}, unrelated {len(flags) - len(related_cluster)}: {str(flags)}"
+            f"[Act][Pruning] Related {len(related_cluster)}, unrelated {len(flags) - len(related_cluster)}: {str(flags)}"
         )
 
         if not related_cluster:
@@ -611,6 +624,12 @@ User Request:
             available_actions = Action.get_format_prompt(exclude_types=[ActionType.Search])
         time_line.add("pruning")
 
+        llm_detail_list = [detail for _, detail in related_tasks_res]
+        pruning_time = time_line.content[-1][1] - time_line.content[-2][1]
+        pruning_prompt_tokens = sum(detail["prompt_tokens"] for detail in llm_detail_list)
+        pruning_completion_tokens = sum(detail["completion_tokens"] for detail in llm_detail_list)
+        pruning_tokens = (pruning_prompt_tokens, pruning_completion_tokens, SecondaryLLM.image_model)
+
         tabs_info = await self.tab_manager.get_tabs_info()
         current_tabs = f"{tabs_info}\n{viewport.get_viewport_scroll_info()}"
 
@@ -630,13 +649,13 @@ User Request:
         action_details_list = []
         raw_action_list = [line for line in llm_action_res.strip().split("\n") if line.strip()]
         raw_action_types = [raw_action.split(",", maxsplit=1)[0].strip() for raw_action in raw_action_list]
-        logger.debug(f"[Action] Generate {len(raw_action_list)} actions: [{', '.join(raw_action_types)}]")
+        logger.debug(f"[Act] Generate {len(raw_action_list)} actions: [{', '.join(raw_action_types)}]")
 
         old_tab_info = await self.tab_manager.get_cur_tab_info()
         for action_index, raw_action in enumerate(raw_action_list, 1):
             action_uid = gen_uid()
             action_prefix = f"{record_prefix}_{action_index:03}_{action_uid}"
-            logger.debug(f"[Action] {action_index}. {raw_action}")
+            logger.debug(f"[Act] {action_index}. {raw_action}")
             action_screenshot = await tab_screenshot(cur_tab)
             action_screenshot_draw = ImageDraw.Draw(action_screenshot)
             draw_text_label(
@@ -714,9 +733,7 @@ User Request:
                 rest_raw_action_list = raw_action_list[action_index:]
                 error_reason = "Tab id changed" if tab_id_changed else "Last action failed"
                 error_msg = f"{error_reason}, stop executing the remaining actions"
-                logger.debug(
-                    f"[Action] {error_reason}, stop executing the remaining {len(rest_raw_action_list)} actions"
-                )
+                logger.debug(f"[Act] {error_reason}, stop executing the remaining {len(rest_raw_action_list)} actions")
                 action_screenshot = await tab_screenshot(cur_tab)
                 draw_text_label(action_screenshot_draw, text=error_msg, position=(10, 40), font=self.font_18)
                 result_screenshot_path = action_screenshot_path = (
@@ -740,6 +757,8 @@ User Request:
             index=record_index,
             action_details_list=action_details_list,
             time_line=time_line,
+            pruning_time=pruning_time,
+            pruning_tokens=pruning_tokens,
             interactive_nodes_repr=interactive_nodes_repr,
             llm_details=llm_action_detail,
             act_goal=act_goal,
@@ -785,25 +804,34 @@ User Request:
                             }
                             for d in record.action_details_list
                         ],
+                        "pruning_time": round(record.pruning_time, 4),
+                        "pruning_tokens": {
+                            "prompt_tokens": record.pruning_tokens[0],
+                            "completion_tokens": record.pruning_tokens[1],
+                            "model": record.llm_details["model"],
+                        },
                         "token_usage": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
+                            "model": record.llm_details["model"],
                         },
                         "time_cost": round(record.time_line.total_time(), 4),
+                        "time_point": record.time_line.endpoint(),
                     }
                 )
             elif isinstance(record, ObservationRecord):
-                token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-                if record.llm_details is not None:
-                    token_usage["prompt_tokens"] = record.llm_details["prompt_tokens"]
-                    token_usage["completion_tokens"] = record.llm_details["completion_tokens"]
 
                 records.append(
                     {
                         "type": "observation",
                         "observation": record.observation,
                         "time_cost": round(record.time_line.total_time(), 4),
-                        "token_usage": token_usage,
+                        "time_point": record.time_line.endpoint(),
+                        "token_usage": {
+                            "prompt_tokens": record.llm_details["prompt_tokens"],
+                            "completion_tokens": record.llm_details["completion_tokens"],
+                            "model": record.llm_details["model"],
+                        },
                     }
                 )
             elif isinstance(record, PlanningRecord):
@@ -815,10 +843,13 @@ User Request:
                         "task_state": record.task_state,
                         "act_goal": record.act_goal,
                         "task_completed": record.task_completed,
+                        "screenshot_name": record.screenshot_path.name,
                         "time_cost": round(record.time_line.total_time(), 4),
+                        "time_point": record.time_line.endpoint(),
                         "token_usage": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
+                            "model": record.llm_details["model"],
                         },
                     }
                 )
@@ -828,9 +859,11 @@ User Request:
                         "type": "extraction",
                         "data": record.data,
                         "time_cost": round(record.time_line.total_time(), 4),
+                        "time_point": record.time_line.endpoint(),
                         "token_usage": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
+                            "model": record.llm_details["model"],
                         },
                     }
                 )
@@ -840,9 +873,11 @@ User Request:
                         "type": "feedback",
                         "feedback": record.repr,
                         "time_cost": round(record.time_line.total_time(), 4),
+                        "time_point": record.time_line.endpoint(),
                         "token_usage": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
+                            "model": record.llm_details["model"],
                         },
                     }
                 )
@@ -886,7 +921,6 @@ User Request:
                 ensure_ascii=False,
                 indent=2,
             )
-
         return out
 
     @staticmethod
@@ -900,7 +934,7 @@ User Request:
         report_lines.append("")
 
         # Part 1: Overall Summary
-        report_lines.append("## 1. Overall Summary")
+        report_lines.append("## Overall Summary")
         report_lines.append("")
         # User Request
         report_lines.append("### User Request")
@@ -938,30 +972,102 @@ User Request:
             counter[record["type"]] += 1
         report_lines.append("### Time Cost (seconds)")
         report_lines.append("")
-        report_lines.append("| Type | Time | Avg Time |")
-        report_lines.append("|------|------|---------|")
+        report_lines.append("| Type | Count | Time | Avg Time |")
+        report_lines.append("|------|-------|------|----------|")
         report_lines.append(
-            f"| Total | {time_cost['total_time']} | {time_cost['total_time'] / counter["planning"]:.4f} |"
+            f"| Total | {counter["planning"]} | {time_cost['total_time']} | {time_cost['total_time'] / counter["planning"]:.4f} |"
         )
-        for type_name in ("act", "observation", "planning", "extraction", "feedback"):
+        type_names = ("planning", "extraction", "feedback", "act", "observation")
+        for type_name in type_names:
             if counter[type_name] == 0:
                 continue
             time_key = type_name + "_time"
             report_lines.append(
-                f"| {type_name.title()} | {time_cost[time_key]} | {time_cost[time_key] / counter[type_name]:.4f} |"
+                f"| {type_name.title()} | {counter[type_name]} | {time_cost[time_key]} | {time_cost[time_key] / counter[type_name]:.4f} |"
             )
+        report_lines.append("")
+        # Ganntt Chart
+        # 甘特图
+        global_start = min(r["time_point"][0] for r in records)
+        global_end = max(r["time_point"][1] for r in records)
+        ganntt_spans = []
+        for index, r in enumerate(records):
+            start = r["time_point"][0] - global_start
+            end = r["time_point"][1] - global_start
+            ganntt_spans.append(
+                {
+                    "index": index,
+                    "label": r["type"],
+                    "start": start,
+                    "duration": end - start,
+                }
+            )
+        # 1. 按 label 分组（每种 label 一行）
+        label_to_spans = defaultdict(list)
+        for span in ganntt_spans:
+            label_to_spans[span["label"]].append(span)
+        labels = tuple(reversed(type_names))
+        # 2. 为每种 label 分配一行 y 轴位置
+        label_to_y = {label: i for i, label in enumerate(labels)}
+        # 3. 为每种 label 分配一种颜色
+        cmap = plt.get_cmap("tab10")  # 颜色足够区分
+        label_to_color = {label: cmap(i % cmap.N) for i, label in enumerate(labels)}
+        label_height = 0.6
+        _, ax = plt.subplots(figsize=(max(2, (global_end - global_start) // 20) * 5, len(labels) * label_height * 1))
+        for label, spans in label_to_spans.items():
+            y = label_to_y[label]
+            color = label_to_color[label]
+            for span in spans:
+                start = span["start"]
+                duration = span["duration"]
+                end = start + duration
+                index = span["index"]
+                # 4. 绘制甘特条
+                ax.barh(y=y, width=duration, left=start, height=label_height, color=color, edgecolor="black", alpha=0.8)
+                # 5. 标记 start、duration、end
+                ax.text(
+                    start + duration + 0.1,
+                    y,
+                    f"{start:.2f}\n{duration:.2f}s\n{end:.2f}",
+                    ha="left",
+                    va="center",
+                    fontsize=8,
+                )
+                # 6. 标记 index（放在条中间）
+                ax.text(
+                    start + duration / 2,
+                    y,
+                    f"#{index}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white",
+                    weight="bold",
+                )
+        ax.set_yticks([label_to_y[label] for label in labels])
+        ax.set_yticklabels(labels)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Label")
+        ax.set_title("Gantt Chart")
+        ax.grid(axis="x", linestyle="--", alpha=0.4)
+        ax.set_axisbelow(True)
+        plt.tight_layout()
+        plt.savefig(out_dir / "gantt.png")
+        report_lines.append("![Gantt Chart](gantt.png)")
         report_lines.append("")
 
         # Part 2: Progress History
-        report_lines.append("## 2. Progress History")
+        report_lines.append("## Progress History")
         report_lines.append("")
         for record in records:
             if record["type"] == "planning":
                 report_lines.append(f"- {record.get('new_progress', '')}")
+            if record["type"] == "extraction":
+                report_lines.append(f"- {record.get('data', '')}")
         report_lines.append("")
 
         # Part 3: Execution Records
-        report_lines.append("## 3. Execution Records")
+        report_lines.append("## Execution Records")
         report_lines.append("")
 
         for idx, record in enumerate(records, start=1):
@@ -972,7 +1078,12 @@ User Request:
                 report_lines.append(f"### {idx}. Act")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
+                )
+                report_lines.append(f"- **Pruning Time**: {record['pruning_time']}s")
+                pruning_tokens = record["pruning_tokens"]
+                report_lines.append(
+                    f"- **Pruning Token Usage**: prompt={pruning_tokens['prompt_tokens']}, completion={pruning_tokens['completion_tokens']}, model={pruning_tokens['model']}"
                 )
                 report_lines.append("")
                 report_lines.append("**Actions:**")
@@ -988,7 +1099,7 @@ User Request:
                     # 并排显示截图
                     action_img = f"![Action]({action['action_screenshot_name']})"
                     result_img = f"![Result]({action['result_screenshot_name']})" if action["success"] else ""
-                    if action["success"]:
+                    if action_img and result_img:
                         # 使用 HTML 表格并排
                         img_html = f"<table><tr><td>{action_img}</td><td>{result_img}</td></tr></table>"
                         report_lines.append(f"    - **Screenshots**: {img_html}")
@@ -1001,7 +1112,7 @@ User Request:
                 report_lines.append(f"### {idx}. Observation")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
                 )
                 report_lines.append("")
                 report_lines.append("**Observation**:")
@@ -1012,34 +1123,22 @@ User Request:
                 report_lines.append(f"### {idx}. Planning")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
                 )
                 report_lines.append(f"- **Task Completed**: {record['task_completed']}")
-                report_lines.append("")
 
-                report_lines.append("**New Progress:**")
-                report_lines.append(record.get("new_progress", ""))
-                report_lines.append("")
-
-                report_lines.append("**Requested Data Found:**")
-                report_lines.append(record.get("requested_data_found", ""))
-                report_lines.append("")
-
-                report_lines.append("**Task State:**")
-                report_lines.append(record.get("task_state", ""))
-                report_lines.append("")
-
-                report_lines.append("")
-                report_lines.append("**Act Goal:**")
-                report_lines.append(record.get("act_goal", ""))
-                report_lines.append("")
+                report_lines.append(f"- **New Progress:** {record.get('new_progress', '')}")
+                report_lines.append(f"- **Requested Data Found:** {record.get('requested_data_found', '')}")
+                report_lines.append(f"- **Task State:** {record.get('task_state', '')}")
+                report_lines.append(f"- **Act Goal:** {record.get('act_goal', '')}")
+                report_lines.append(f"- **Planning Screenshot**: ![Planning]({record['screenshot_name']})")
                 report_lines.append("")
             # Feedback Record
             elif record_type == "feedback":
                 report_lines.append(f"### {idx}. Feedback")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
                 )
                 report_lines.append("")
                 report_lines.append("**Feedback**:")
@@ -1050,7 +1149,7 @@ User Request:
                 report_lines.append(f"### {idx}. Extraction")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}"
+                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
                 )
                 report_lines.append("")
                 report_lines.append("**Extraction**:")

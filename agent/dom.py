@@ -177,7 +177,7 @@ class DomNode:
         return node_list
 
     def __repr__(self):
-        return f"<DomNode:{self.tag} id={self.local_id} {self.text if self.text else ''}>"
+        return f"<DomNode tag={self.tag} id={self.local_id} text={self.text}>"
 
     @property
     def editable(self) -> bool:

@@ -33,7 +33,7 @@ The output should contain the following sections:
 - A one-sentence summary of the current overall task completion status, explicitly stating either what remains unfinished or that the task is fully completed with nothing missing. Example: The task is partially complete; the profile page has been accessed, but the user's subscription details are still missing.
 
 ### Act Goal
-- A one-sentence, UI-grounded goal describing the next step the Act Agent should take to achieve a clear objective. The goal must: State the purpose and actionable steps that are directly executable and sequentially feasible, including clicking elements, inputing text, pressing keys, scrolling the page, navigating to URL, or switching/closing tabs. Example: Click the "Subscription" tab on the profile page to view the user's subscription details.
+- A one-sentence, UI-grounded goal describing the next step the Act Agent should take to achieve a clear objective. The goal must: State the purpose and actionable steps that are directly executable and sequentially feasible, including clicking elements, inputing text, scrolling the page, navigating to URL, waiting, or switching/closing tabs. Example: Click the "Subscription" tab on the profile page to view the user's subscription details.
 - If the Task State indicates that the task is fully complete, use: TASK_FULLY_FINISHED
 
 ## Output format

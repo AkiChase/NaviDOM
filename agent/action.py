@@ -28,6 +28,7 @@ class ActionType(Enum):
     # Press = "PRESS"
     TabSwitch = "TAB_SWITCH"
     TabClose = "TAB_CLOSE"
+    WAIT = "WAIT"
     Navigate = "NAVIGATE"
     Search = "SEARCH"
 
@@ -41,6 +42,7 @@ action_format_prompt = {
     # ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to the specified tab making it the active and visible tab",
     ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
+    ActionType.WAIT: "WAIT, <seconds>\t// Wait for <seconds:float> seconds",
     ActionType.Navigate: "NAVIGATE, <url>\t// Navigate to the specified URL",
     ActionType.Search: "SEARCH, <keywords>\t// Navigate to Bing search results for the given keywords",
     # ActionType.Memory: "MEMORY, <content>\t// If the user request requires certain information to be output, explicitly record <content> (\\n for line breaks) using this action.",
@@ -90,6 +92,9 @@ class Action:
             for node in dom_nodes:
                 target = node.find_children_by_local_ids([target_id])[0]
                 if target is not None:
+                    if target.tag == "":
+                        target = target.parent
+                        assert target is not None, f"Target text node[{target_id}] has no parent"
                     return target
             raise ActionParseException(f"Node[{target_id}] not found")
 
@@ -107,6 +112,8 @@ class Action:
             assert clear_raw in ("true", "false"), ActionParseException(f"Invalid clear value: {clear_raw}")
             clear = clear_raw == "true"
             text = sub_parts[2].replace("\\n", "\n")
+            if text[0] == '"' and text[-1] == '"':
+                text = text[1:-1]
             target = find_target(sub_parts[0])
             return Action(
                 uid,
@@ -155,6 +162,11 @@ class Action:
             if tab_id not in tab_manager.tab_dict:
                 raise ActionParseException(f"Tab ID {tab_id} not found")
             return Action(uid, action_type, None, {"tab_id": tab_id})
+        elif action_type == ActionType.WAIT:
+            # WAIT, <seconds>
+            assert len(parts) == 2, ActionParseException(f"Invalid WAIT format: {raw_action}")
+            seconds = float(parts[1])
+            return Action(uid, action_type, None, {"seconds": seconds})
         # elif action_type == ActionType.Memory:
         #     # MEMORY, <content>
         #     assert len(parts) == 2, ActionParseException(f"Invalid MEMORY format: {raw_action}")
@@ -192,7 +204,7 @@ class Action:
                     await loc.click(timeout=5000, force=True)
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1)
             elif self.type == ActionType.Input:
                 clear = self.extra["clear"]
                 text = self.extra["text"]
@@ -204,7 +216,7 @@ class Action:
                     await loc.press("Enter")
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1)
         elif self.type == ActionType.Scroll:
             pages = self.extra["pages"]
             dy = Config.browser_viewport_h * pages
@@ -244,6 +256,9 @@ class Action:
             tab = tab_manager.tab_dict[tab_id]
             await tab.close()
             await asyncio.sleep(0.5)
+        elif self.type == ActionType.WAIT:
+            seconds = self.extra["seconds"]
+            await asyncio.sleep(seconds)
         # elif self.type == ActionType.Memory:
         #     content = self.extra["content"]
         #     memory.append(content)

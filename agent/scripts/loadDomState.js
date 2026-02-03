@@ -95,7 +95,13 @@
                 stack.push({ el, visited: true });
                 if (el.tagName === "IFRAME") continue; // skip iframe children
 
-                const children = Array.from(el.childNodes);
+                // const children = Array.from(el.childNodes);
+                const children = [];
+                children.push(...el.childNodes);
+                // Shadow DOM children
+                if (el.shadowRoot) {
+                    children.push(...el.shadowRoot.childNodes);
+                }
                 for (let i = children.length - 1; i >= 0; i--) {
                     const child = children[i];
                     if (child.nodeType !== Node.ELEMENT_NODE && child.nodeType !== Node.TEXT_NODE) continue; // skip non-element/text node
@@ -107,6 +113,12 @@
                 // collect final children
                 const children = [];
                 for (const child of el.childNodes) {
+                    const childNode = nodeMap.get(child);
+                    if (childNode) {
+                        children.push(childNode);
+                    }
+                }
+                for (const child of el.shadowRoot?.childNodes || []) {
                     const childNode = nodeMap.get(child);
                     if (childNode) {
                         children.push(childNode);

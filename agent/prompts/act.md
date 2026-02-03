@@ -9,7 +9,7 @@ Your responsibility is to construct appropriate Action instructions based on the
 - Interactive Nodes: All interactive nodes in the current visible tab. An image of these nodes is also provided. Each Node is in format as [node_id]<html-code>
 
 ## Your Task
-Based on all inputs, construct appropriate Action instructions.
+Based on all inputs, construct appropriate Actions from the available Actions.
 Note:
 - Only nodes with numeric node_id in [] are interactive
 - (stacked) indentation (with \t) is important and means that the node is a (html) child of the node above (with a lower index)
