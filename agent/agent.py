@@ -27,6 +27,7 @@ from agent.record import (
     FeedbackRecord,
     ObservationRecord,
     PlanningRecord,
+    PruningDetails,
     Record,
     TimeLine,
 )
@@ -411,7 +412,7 @@ You are a web AI agent designed to automate browser tasks.
 Your task is to analyze the User Request and determine the initial browser tab page to navigate to.
 
 Available Actions:
-{Action.get_format_prompt([ActionType.Navigate, ActionType.Search])}
+{Action.get_available_actions_prompt([ActionType.Navigate, ActionType.Search])}
 
 Requirements:
 - If the user request explicitly specifies a URL to start from, output a NAVIGATE action with that URL.
@@ -466,11 +467,19 @@ User Request:
         )
 
         time_line.add(f"execute_{action_index:03}")
+        pruning_details: PruningDetails = {
+            "time": 0,
+            "model": SecondaryLLM.image_model,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "result": [],
+            "token_reduction": 0,
+        }
+
         record = ActRecord(
             index=record_index,
             action_details_list=[action_details],
-            pruning_time=0,
-            pruning_tokens=(0, 0, SecondaryLLM.image_model),
+            pruning_details=pruning_details,
             time_line=time_line,
             llm_details=llm_details,
             interactive_nodes_repr="",
@@ -506,6 +515,7 @@ User Request:
             atomic_screenshot.save(self.out_dir / f"{record_prefix}_debug_1_atomic.jpg")
 
         interactive_nodes = dom.extract_interactive_nodes(dom)
+        logger.debug("[Act] Interactive node count: {}", len(interactive_nodes))
 
         if Config.debug:
             # 交互粒度元素可视化
@@ -529,9 +539,11 @@ User Request:
         # 筛除尺寸过小的无效聚类
         clusters: list[list[DomNode]] = []
         for c in DomCluster.cluster_construct(interactive_nodes, alpha=0.45, distance_threshold=0.45):
-            rect = DomCluster.cluster_covered_xyxy(c)
+            rect = DomCluster.cluster_covered_xyxy(c, viewport)
             w, h = rect[2] - rect[0], rect[3] - rect[1]
-            if w <= 2.5 or h <= 2.5:
+            min_side = min(w, h)
+            max_side = max(w, h)
+            if min_side < 10 and max_side / max(min_side, 1e-6) > 20:
                 continue
             clusters.append(c)
 
@@ -556,7 +568,7 @@ User Request:
                         max_bounds=True,
                     )
 
-                rect = DomCluster.cluster_covered_xyxy(cluster)
+                rect = DomCluster.cluster_covered_xyxy(cluster, viewport)
                 cluster_screenshot_draw.rectangle(rect, outline=color, width=width + 2)
                 draw_text_label(
                     draw=cluster_screenshot_draw,
@@ -567,13 +579,12 @@ User Request:
                     bg_color=color,
                 )
             cluster_screenshot.save(self.out_dir / f"{record_prefix}_debug_3_cluster_all.jpg")
-            time_line.add("_debug")
 
         # 基于LLM过滤与任务不相关的聚类区域
         related_tasks = []
         related_rects = []
         for index, cluster in enumerate(clusters):
-            rect = DomCluster.cluster_covered_xyxy(cluster)
+            rect = DomCluster.cluster_covered_xyxy(cluster, viewport)
             related_rects.append(rect)
             cluster_region = screenshot.crop(rect)
             cluster_region_draw = ImageDraw.Draw(cluster_region)
@@ -589,8 +600,7 @@ User Request:
                     node_bounds[3] - rect[1],
                 )
                 cluster_region_draw.rectangle(node_bounds, outline="red", width=2)
-            if Config.debug:
-                cluster_region.save(self.out_dir / f"{record_prefix}_debug_4_cluster_{index + 1}.jpg")
+            cluster_region.save(self.out_dir / f"{record_prefix}_cluster_{index + 1}.jpg")
             related_tasks.append(DomCluster.determine_cluster_related(cluster, cluster_region, task=act_goal))
         related_tasks_res: list[tuple[bool, ChatImageDetails]] = await asyncio.gather(*related_tasks)
         related_cluster = [
@@ -607,7 +617,7 @@ User Request:
             )
             final_nodes = []
             interactive_nodes_repr = "No act goal related interactive nodes."
-            available_actions = Action.get_format_prompt(
+            available_actions = Action.get_available_actions_prompt(
                 exclude_types=[ActionType.Click, ActionType.Input, ActionType.Search]
             )
         else:
@@ -616,19 +626,26 @@ User Request:
             # 构建压缩后的UI图像
             final_screenshot = DomCluster.cluster_image_layout_compaction(screenshot, merged_rects, default_gap=1)
             final_nodes: list[DomNode] = list(itertools.chain.from_iterable(cluster for cluster, _ in related_cluster))
-            if Config.debug:
-                final_screenshot.save(self.out_dir / f"{record_prefix}_debug_5_final.jpg")
+            final_screenshot.save(self.out_dir / f"{record_prefix}_final.jpg")
             interactive_nodes_repr = "\n".join(
                 [node.convert_to_repr_node().get_human_tree_repr(no_end=True) for node in final_nodes]
             )
-            available_actions = Action.get_format_prompt(exclude_types=[ActionType.Search])
+            available_actions = Action.get_available_actions_prompt(exclude_types=[ActionType.Search])
         time_line.add("pruning")
 
         llm_detail_list = [detail for _, detail in related_tasks_res]
-        pruning_time = time_line.content[-1][1] - time_line.content[-2][1]
         pruning_prompt_tokens = sum(detail["prompt_tokens"] for detail in llm_detail_list)
         pruning_completion_tokens = sum(detail["completion_tokens"] for detail in llm_detail_list)
-        pruning_tokens = (pruning_prompt_tokens, pruning_completion_tokens, SecondaryLLM.image_model)
+        pruning_details: PruningDetails = {
+            "time": time_line.content[-1][1] - time_line.content[-2][1],
+            "model": SecondaryLLM.image_model,
+            "prompt_tokens": pruning_prompt_tokens,
+            "completion_tokens": pruning_completion_tokens,
+            "result": flags,
+            "token_reduction": sum(
+                detail["prompt_tokens"] for detail, flag in zip(llm_detail_list, flags) if flag == False
+            ),
+        }
 
         tabs_info = await self.tab_manager.get_tabs_info()
         current_tabs = f"{tabs_info}\n{viewport.get_viewport_scroll_info()}"
@@ -757,8 +774,7 @@ User Request:
             index=record_index,
             action_details_list=action_details_list,
             time_line=time_line,
-            pruning_time=pruning_time,
-            pruning_tokens=pruning_tokens,
+            pruning_details=pruning_details,
             interactive_nodes_repr=interactive_nodes_repr,
             llm_details=llm_action_detail,
             act_goal=act_goal,
@@ -804,12 +820,13 @@ User Request:
                             }
                             for d in record.action_details_list
                         ],
-                        "pruning_time": round(record.pruning_time, 4),
+                        "pruning_time": round(record.pruning_details["time"], 4),
                         "pruning_tokens": {
-                            "prompt_tokens": record.pruning_tokens[0],
-                            "completion_tokens": record.pruning_tokens[1],
-                            "model": record.llm_details["model"],
+                            "prompt_tokens": record.pruning_details["prompt_tokens"],
+                            "completion_tokens": record.pruning_details["completion_tokens"],
+                            "model": record.pruning_details["model"],
                         },
+                        "pruning_token_reduction": record.pruning_details["token_reduction"],
                         "token_usage": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
@@ -820,7 +837,6 @@ User Request:
                     }
                 )
             elif isinstance(record, ObservationRecord):
-
                 records.append(
                     {
                         "type": "observation",

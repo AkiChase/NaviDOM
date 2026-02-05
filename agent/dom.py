@@ -451,7 +451,7 @@ class DomNode:
                 if not output:
                     output.append(node)
                 else:
-                    if node.tag in GROUP_ELEMENTS:
+                    if node.tag in GROUP_ELEMENTS or node.attributes.get("role") in GROUP_ELEMENT_ROLES:
                         output = [node]
 
             return output
@@ -460,34 +460,9 @@ class DomNode:
 
 
 # Interactive Elements
-GROUP_ELEMENTS = {
-    "a",
-    "button",
-    "input",
-    "textarea",
-    "select",
-    "form",
-    # 'ul',
-    # 'ol',
-    # 'li',
-    # 'img',
-    # 'svg',
-    # 'label',
-    # 'nav',
-    # 'header',
-    # 'footer',
-    # 'article',
-    # 'section',
-}
-
-FORCE_REMOVE_ELEMENTS = {
-    "script",
-    "style",
-    "meta",
-    "link",
-    "title",
-}
-
+GROUP_ELEMENTS = {"a", "button", "input", "textarea", "select", "form", "checkbox", "dialog"}
+GROUP_ELEMENT_ROLES = {"button", "checkbox", "radio", "switch", "textbox", "combobox", "listbox", "dialog"}
+FORCE_REMOVE_ELEMENTS = {"script", "style", "meta", "link", "title"}
 SUPPORT_ELEMENTS = {
     # ========= 文档 / 布局语义 =========
     "html",
@@ -876,7 +851,7 @@ DOM elements:
         return flag, res
 
     @staticmethod
-    def cluster_covered_xyxy(nodes: list[DomNode]) -> tuple[float, float, float, float]:
+    def cluster_covered_xyxy(nodes: list[DomNode], viewport: Viewport) -> tuple[float, float, float, float]:
         max_bounds = [node.max_bounds() for node in nodes]
         valid_bounds = [b.to_xyxy() for b in max_bounds if b is not None]
         assert valid_bounds, "cluster contains no bounds"
@@ -885,6 +860,11 @@ DOM elements:
         y1 = min(b[1] for b in valid_bounds)
         x2 = max(b[2] for b in valid_bounds)
         y2 = max(b[3] for b in valid_bounds)
+        # ensure within viewport
+        x1 = max(x1, 0)
+        y1 = max(y1, 0)
+        x2 = min(x2, viewport.width)
+        y2 = min(y2, viewport.height)
 
         return x1, y1, x2, y2
 

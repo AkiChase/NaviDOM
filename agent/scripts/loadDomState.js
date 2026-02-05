@@ -139,17 +139,28 @@
                     nodeMap.set(el, node);
                 } else {
                     const curBounds = getClientBounds(el);
-                    // skip invisible elements without visible children
-                    if ((children.length === 0 || children.every(child => child.tag === "")) && (curBounds === null || !isStyleVisible(el))) continue;
-
+                    const tag = el.tagName.toLowerCase();
+                    let selector = null
+                    if (!!el.closest('select')) {
+                        // Do not consider child nodes for <select/> 
+                        if (tag === 'select') {
+                            if ((curBounds === null || !isStyleVisible(el))) continue;
+                            selector = CssSelectorGenerator.getCssSelector(el, { includeTag: true, maxCombinations: 10 })
+                        }
+                        // keep all child nodes of <select/> with null selector
+                    } else {
+                        // skip invisible elements without visible children
+                        if ((children.length === 0 || children.every(child => child.tag === "")) && (curBounds === null || !isStyleVisible(el))) continue;
+                        selector = CssSelectorGenerator.getCssSelector(el, { includeTag: true, maxCombinations: 10 })
+                    }
                     const node = {
-                        tag: el.tagName.toLowerCase(),
+                        tag,
                         attrs: getAttributes(el),
                         bounds: curBounds,
                         children,
                         text: "",
                         index: getElementChildIndex(el),
-                        selector: CssSelectorGenerator.getCssSelector(el),
+                        selector,
                     };
                     nodeMap.set(el, node);
                 }

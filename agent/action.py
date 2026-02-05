@@ -25,6 +25,7 @@ class ActionType(Enum):
     Click = "CLICK"
     Input = "INPUT"
     Scroll = "SCROLL"
+    # SelectOption = "SELECT_OPTION"
     # Press = "PRESS"
     TabSwitch = "TAB_SWITCH"
     TabClose = "TAB_CLOSE"
@@ -35,10 +36,12 @@ class ActionType(Enum):
 
 all_action_types = list(ActionType)
 
+# TODO 补充SelectOption, 要给出option_node_ids用可变args长度吧说明如果有多个则继续用逗号分隔，并实现解析和执行
 action_format_prompt = {
     ActionType.Click: "CLICK, <node_id>",
     ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// Focus and input <text> into the specified input or textarea node. In <text>, only \\n has special meaning for line breaks; no other escaping is required",
     ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>. Minimum scroll increment is 0.1 pages",
+    # ActionType.SelectOption: "SELECT_OPTION, <select_node_id>, <option_node_ids>\t// Select the specified option(s) node in the select HTML node identified by <select_node_id:int[]>",
     # ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to the specified tab making it the active and visible tab",
     ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
@@ -71,7 +74,7 @@ class Action:
         return ", ".join(out)
 
     @staticmethod
-    def get_format_prompt(include_types: list[ActionType] | None = None, exclude_types: list[ActionType] | None = None):
+    def get_available_actions_prompt(include_types: list[ActionType] | None = None, exclude_types: list[ActionType] | None = None):
         if include_types is None:
             include_types = all_action_types
         if exclude_types is None:
@@ -112,7 +115,7 @@ class Action:
             assert clear_raw in ("true", "false"), ActionParseException(f"Invalid clear value: {clear_raw}")
             clear = clear_raw == "true"
             text = sub_parts[2].replace("\\n", "\n")
-            if text[0] == '"' and text[-1] == '"':
+            if text and text[0] == '"' and text[-1] == '"':
                 text = text[1:-1]
             target = find_target(sub_parts[0])
             return Action(

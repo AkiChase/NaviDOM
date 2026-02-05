@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
+from typing import TypedDict
 
 from agent.action import ActionDetails
 from agent.llm import ChatImageDetails, ChatImageListDetails, ChatTextDetails
@@ -106,12 +107,20 @@ class FeedbackRecord(Record):
         )
 
 
+class PruningDetails(TypedDict):
+    time: float
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    result: list[bool]
+    token_reduction: int
+
+
 @dataclass
 class ActRecord(Record):
     action_details_list: list[ActionDetails]
     llm_details: ChatImageDetails | ChatTextDetails
-    pruning_time: float
-    pruning_tokens: tuple[int, int, str]
+    pruning_details: PruningDetails
     interactive_nodes_repr: str
     act_goal: str
 
@@ -138,12 +147,7 @@ class ActRecord(Record):
                 "action_details_list": [a.to_dict() for a in self.action_details_list],
                 "time_line": self.time_line.to_dict(),
                 "llm_details": self.llm_details,
-                "pruning_time": self.pruning_time,
-                "pruning_tokens": {
-                    "prompt_tokens": self.pruning_tokens[0],
-                    "completion_tokens": self.pruning_tokens[1],
-                    "model": self.pruning_tokens[2],
-                },
+                "pruning_details": self.pruning_details,
                 "interactive_nodes_repr": self.interactive_nodes_repr,
                 "act_goal": self.act_goal,
             },
