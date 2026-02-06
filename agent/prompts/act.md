@@ -23,6 +23,7 @@ Note:
 
 ## Output Requirements
 - All Actions MUST strictly follow the formats listed in Available Actions. Each Action must be output on its own line.
+- The node_id should not include [], only the number part.
 - Do NOT include explanations or any additional text.
 
 ## Inputs Details

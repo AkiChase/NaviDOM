@@ -256,66 +256,6 @@ class DomNode:
 
         return [node_map.get(i) for i in target_ids]
 
-    def _id_selector(self) -> str | None:
-        _id = self.attributes.get("id")
-        return f"#{_id}" if _id else None
-
-    def _data_attr_selectors(self) -> list[str]:
-        res = []
-        for k, v in self.attributes.items():
-            if k.startswith("data-") and v:
-                res.append(f'[{k}="{v}"]')
-        return res
-
-    def _semantic_attr_selectors(self) -> list[str]:
-        res = []
-        for k in ("name", "type", "role", "aria-label", "placeholder", "title"):
-            v = self.attributes.get(k)
-            if v:
-                res.append(f'[{k}="{v}"]')
-        return res
-
-    def _local_selector_candidates(self) -> Iterator[str]:
-        seen: set[str] = set()
-
-        def emit(sel: str):
-            if sel not in seen:
-                seen.add(sel)
-                yield sel
-
-        tag = self.tag or "*"
-        # 1) id
-        id_sel = self._id_selector()
-        if id_sel:
-            yield from emit(id_sel)  # #id
-            yield from emit(f"{tag}{id_sel}")  # tag#id
-        # 2) iframe (src)
-        if self.tag == "iframe":
-            src = self.attributes.get("src")
-            if src is not None:
-                yield from emit(f'{tag}[src="{src}"]')
-
-        # 3) data-* / semantic attributes
-        for sel in self._data_attr_selectors():
-            yield from emit(f"{tag}{sel}")
-        for sel in self._semantic_attr_selectors():
-            yield from emit(f"{tag}{sel}")
-        # 4) only tag
-        yield from emit(tag)
-
-    def _local_with_index_candidates(self) -> Iterator[str]:
-        seen: set[str] = set()
-
-        def emit(sel: str):
-            if sel not in seen:
-                seen.add(sel)
-                yield sel
-
-        for base in self._local_selector_candidates():
-            if self.index is not None:
-                yield from emit(f"{base}:nth-child({self.index})")
-            yield from emit(base)
-
     def get_description(self, full=True) -> str:
 
         def collect_text(node: "DomNode") -> list[str]:
@@ -335,35 +275,8 @@ class DomNode:
         content = f'({" ".join(text)})' if text else ""
         return f"{self.tag}{content}"
 
-    def get_selector_variants(self, max_depth: int = 8) -> Iterator[str]:
-        seen: set[str] = set()
-        # 1) 只用当前节点本身的 selector（各种属性组合）
-        for sel in self._local_with_index_candidates():
-            if sel not in seen:
-                seen.add(sel)
-                yield sel
-        # 2) 用父节点 + 当前节点，逐步向上组合
-        cur = self
-        depth = 0
-        suffix_selectors = list(cur._local_with_index_candidates())
-        while cur.tag != "iframe" and cur.parent is not None and depth < max_depth - 1:
-            parent = cur.parent
-            depth += 1
-            parent_sels = parent._local_with_index_candidates()
-            p_sel_1 = next(parent_sels)
-            p_sel_2 = next(parent_sels)
-            new_suffixes = []
-            for suffix in suffix_selectors:
-                for p_sel in (p_sel_1, p_sel_2):
-                    full = f"{p_sel} > {suffix}"
-                    if full not in seen:
-                        seen.add(full)
-                        yield full
-                    new_suffixes.append(full)
-            # 向上推进时，保留完整路径
-            suffix_selectors = new_suffixes
-            cur = parent
-        # 3) 最退化的结构型 selector：tag + nth-child
+    def get_simple_selector(self, max_depth: int = 8) -> str:
+        # 结构型 selector：tag + nth-child
         cur = self
         parts = []
         while cur is not None and cur.tag != "iframe" and len(parts) < max_depth:
@@ -372,11 +285,8 @@ class DomNode:
             else:
                 parts.append(cur.tag)
             cur = cur.parent
-        if parts:
-            selector = " > ".join(reversed(parts))
-            if selector not in seen:
-                seen.add(selector)
-                yield selector
+        selector = " > ".join(reversed(parts))
+        return selector
 
     async def find_owner_frame(self, tab: Page) -> Frame | None:
         if self.frame_node_id == -1:
@@ -414,10 +324,9 @@ class DomNode:
             if await locator.count() == 1:
                 return locator
 
-        for selector in self.get_selector_variants():
-            locator = frame.locator(selector)
-            if await locator.count() == 1:
-                return locator
+        locator = frame.locator(self.get_simple_selector())
+        if await locator.count() == 1:
+            return locator
         return None
 
     _ancestor_set: set["DomNode"] | None = None

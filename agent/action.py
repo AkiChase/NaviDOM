@@ -8,7 +8,6 @@ from agent.config import Config
 from agent.dom import DomNode
 from playwright.async_api import Page
 
-from agent.llm import ChatTextDetails, SecondaryLLM
 from agent.utils import SpecialException, bing_search_url
 from agent.tab import TabManager
 
@@ -25,7 +24,7 @@ class ActionType(Enum):
     Click = "CLICK"
     Input = "INPUT"
     Scroll = "SCROLL"
-    # SelectOption = "SELECT_OPTION"
+    SelectOption = "SELECT_OPTION"
     # Press = "PRESS"
     TabSwitch = "TAB_SWITCH"
     TabClose = "TAB_CLOSE"
@@ -36,12 +35,11 @@ class ActionType(Enum):
 
 all_action_types = list(ActionType)
 
-# TODO 补充SelectOption, 要给出option_node_ids用可变args长度吧说明如果有多个则继续用逗号分隔，并实现解析和执行
 action_format_prompt = {
     ActionType.Click: "CLICK, <node_id>",
     ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// Focus and input <text> into the specified input or textarea node. In <text>, only \\n has special meaning for line breaks; no other escaping is required",
     ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>. Minimum scroll increment is 0.1 pages",
-    # ActionType.SelectOption: "SELECT_OPTION, <select_node_id>, <option_node_ids>\t// Select the specified option(s) node in the select HTML node identified by <select_node_id:int[]>",
+    ActionType.SelectOption: "SELECT_OPTION, <select_node_id>, <option_node_id>[, ...]\t// Select option(s) in a <select> HTML element (Exclusive to <select> nodes only; invalid for other node types). Single-select: exactly one <option_node_id>. Multi-select: multiple <option_node_id>s separated by commas",
     # ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to the specified tab making it the active and visible tab",
     ActionType.TabClose: "TAB_CLOSE, <tab_id>\t// Close the specified tab",
@@ -74,7 +72,9 @@ class Action:
         return ", ".join(out)
 
     @staticmethod
-    def get_available_actions_prompt(include_types: list[ActionType] | None = None, exclude_types: list[ActionType] | None = None):
+    def get_available_actions_prompt(
+        include_types: list[ActionType] | None = None, exclude_types: list[ActionType] | None = None
+    ):
         if include_types is None:
             include_types = all_action_types
         if exclude_types is None:
@@ -105,6 +105,8 @@ class Action:
             # CLICK, <local_id>
             assert len(parts) == 2, ActionParseException(f"Invalid CLICK format: {raw_action}")
             target = find_target(parts[1])
+            if not target.clickable:
+                raise ActionParseException(f"Target node {target.get_description(full=False)} is not clickable")
             return Action(uid, action_type, target, {})
         elif action_type == ActionType.Input:
             # INPUT, <local_id>, <clear>, <text>
@@ -118,6 +120,8 @@ class Action:
             if text and text[0] == '"' and text[-1] == '"':
                 text = text[1:-1]
             target = find_target(sub_parts[0])
+            if not target.editable:
+                raise ActionParseException(f"Target node {target.get_description(full=False)} is not editable")
             return Action(
                 uid,
                 action_type,
@@ -141,6 +145,30 @@ class Action:
         #     assert len(parts) == 2, ActionParseException(f"Invalid PRESS format: {raw_action}")
         #     key = parts[1]
         #     return Action(uid, action_type, None, {"key": key})
+        elif action_type == ActionType.SelectOption:
+            # SELECT_OPTION, <select_node_id>, <option_node_id>[, <option_node_id>, ...]
+            assert len(parts) == 2, ActionParseException(f"Invalid SELECT_OPTION format: {raw_action}")
+            sub_parts = [p.strip() for p in parts[1].split(",")]
+
+            option_node_ids = [int(id.strip("[]<>")) for id in sub_parts[1:]]
+            target = find_target(sub_parts[0])
+            if target.tag != "select":
+                raise ActionParseException(f"Target node {target.get_description(full=False)} is not a select node")
+            options = target.find_children_by_local_ids(option_node_ids)
+            errors = []
+            values = []
+            for local_id, opt in zip(option_node_ids, options):
+                if opt is None:
+                    errors.append(f"Option node[{local_id}] not found")
+                elif opt.tag != "option":
+                    errors.append(f"The node[{local_id}] is not an option node")
+                elif opt.attributes.get("value") is None:
+                    errors.append(f"Option node[{local_id}] has no value attribute")
+                else:
+                    values.append(opt.attributes["value"])
+            if errors:
+                raise ActionParseException(f"SELECT_OPTION errors: {'; '.join(errors)}")
+            return Action(uid, action_type, target, {"options": values})
         elif action_type == ActionType.Navigate:
             # NAVIGATE, <url>
             assert len(parts) == 2, ActionParseException(f"Invalid NAVIGATE format: {raw_action}")
@@ -184,14 +212,10 @@ class Action:
             raise ActionParseException(f"Unsupported action type: {action_type}")
 
     async def execute(self, tab: Page, tab_manager: "TabManager"):
-        if self.type in [ActionType.Click, ActionType.Input]:
+        result = None
+        if self.type in [ActionType.Click, ActionType.Input, ActionType.SelectOption]:
             # find target in tab
             assert self.target is not None
-            if self.type == ActionType.Click and not self.target.clickable:
-                raise ActionExecuteException(f"Target node {self.target.get_description(full=False)} is not clickable")
-            if self.type == ActionType.Input and not self.target.editable:
-                raise ActionExecuteException(f"Target node {self.target.get_description(full=False)} is not editable")
-
             frame = await self.target.find_owner_frame(tab)
             if frame is None:
                 raise ActionExecuteException(f"Target {self.target.get_description(full=False)} owner frame not found")
@@ -205,6 +229,8 @@ class Action:
             if self.type == ActionType.Click:
                 try:
                     await loc.click(timeout=5000, force=True)
+                    if self.target.tag == "select":
+                        result = f"Warning! Target node is a select element, CLICK did not work, you should only use SELECT_OPTION instead."
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
                 await asyncio.sleep(1)
@@ -219,6 +245,16 @@ class Action:
                     await loc.press("Enter")
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
+                await asyncio.sleep(1)
+            elif self.type == ActionType.SelectOption:
+                options: list[str] = self.extra["options"]
+                try:
+                    if len(options) == 1:
+                        await loc.select_option(value=options[0], timeout=5000)
+                    else:
+                        await loc.select_option(value=options, timeout=5000)
+                except Exception as e:
+                    raise ActionExecuteException(f"Failed to select option: {e}")
                 await asyncio.sleep(1)
         elif self.type == ActionType.Scroll:
             pages = self.extra["pages"]
@@ -276,6 +312,7 @@ class Action:
         #     return llm_detail
         else:
             raise NotImplementedError(f"Action type {self.type} is not implemented")
+        return result
 
 
 class ActionExecuteResult(TypedDict):

@@ -104,7 +104,6 @@ class Agent:
                 # ensure extraction and feedback task is done
                 feedback_task = await extraction_task
                 await feedback_task
-
                 assert self.last_feedback_record is not None
                 if self.last_feedback_record.all_done:
                     logger.success(f"[Planning] Task completed")
@@ -128,6 +127,10 @@ class Agent:
                 )
                 break
 
+            # TODO 可以考虑加入剩余可执行步数的反馈
+            # TODO 迭代次数加入self和result中
+            # TODO 可以考虑Observation给出明确的3种标签，这对用户反馈会更有意义一点
+
             before_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
             # Act
             await self.act()
@@ -141,7 +144,7 @@ class Agent:
         end_time = datetime.now()
         logger.info(f"[Time] Total time cost: {format_time_delta(start_time, end_time)}")
         logger.info(
-            f"[Time] Per act time cost: {(end_time - start_time).total_seconds() / len([r for r in self.records if isinstance(r, ActRecord)]):.2f}s"
+            f"[Time] Average iteration time cost: {(end_time - start_time).total_seconds() / len([r for r in self.records if isinstance(r, PlanningRecord)]):.2f}s"
         )
         if self.last_feedback_record is not None:
             logger.info(f"[Feedback]:\n{self.last_feedback_record.repr}")
@@ -412,7 +415,7 @@ You are a web AI agent designed to automate browser tasks.
 Your task is to analyze the User Request and determine the initial browser tab page to navigate to.
 
 Available Actions:
-{Action.get_available_actions_prompt([ActionType.Navigate, ActionType.Search])}
+{Action.get_available_actions_prompt(include_types=[ActionType.Navigate, ActionType.Search])}
 
 Requirements:
 - If the user request explicitly specifies a URL to start from, output a NAVIGATE action with that URL.
@@ -618,7 +621,7 @@ User Request:
             final_nodes = []
             interactive_nodes_repr = "No act goal related interactive nodes."
             available_actions = Action.get_available_actions_prompt(
-                exclude_types=[ActionType.Click, ActionType.Input, ActionType.Search]
+                exclude_types=[ActionType.Click, ActionType.Input, ActionType.Search, ActionType.SelectOption]
             )
         else:
             # 合并边界存在重叠的区域，用于构建紧凑的UI图
@@ -630,7 +633,10 @@ User Request:
             interactive_nodes_repr = "\n".join(
                 [node.convert_to_repr_node().get_human_tree_repr(no_end=True) for node in final_nodes]
             )
-            available_actions = Action.get_available_actions_prompt(exclude_types=[ActionType.Search])
+            exclude_types = [ActionType.Search, ActionType.Navigate]
+            if interactive_nodes_repr.find("<select ") == -1:
+                exclude_types.append(ActionType.SelectOption)
+            available_actions = Action.get_available_actions_prompt(exclude_types=exclude_types)
         time_line.add("pruning")
 
         llm_detail_list = [detail for _, detail in related_tasks_res]
@@ -703,13 +709,13 @@ User Request:
                 action_result = await action.execute(cur_tab, self.tab_manager)
                 action_error = None
             except ActionParseException as e:
-                logger.warning(f"[Act] Parse action failed, {e}. Action: {raw_action}")
+                logger.warning(f"[Act] Parse action failed. Action: {raw_action}. Error: {e}.")
                 action_result = str(e)
                 action_error = e
                 action = None
             except ActionExecuteException as e:
                 assert action is not None
-                logger.warning(f"[Act] Execute {action.type.value} action failed: {e}")
+                logger.warning(f"[Act] Execute {action.type.value} action failed. Action: {raw_action}. Error: {e}.")
                 action_result = str(e)
                 action_error = e
 
@@ -748,17 +754,20 @@ User Request:
 
             if tab_id_changed or not action_success:
                 rest_raw_action_list = raw_action_list[action_index:]
-                error_reason = "Tab id changed" if tab_id_changed else "Last action failed"
-                error_msg = f"{error_reason}, stop executing the remaining actions"
-                logger.debug(f"[Act] {error_reason}, stop executing the remaining {len(rest_raw_action_list)} actions")
-                action_screenshot = await tab_screenshot(cur_tab)
-                draw_text_label(action_screenshot_draw, text=error_msg, position=(10, 40), font=self.font_18)
-                result_screenshot_path = action_screenshot_path = (
-                    self.out_dir
-                    / f"{record_prefix}_{action_index:03}-{action_index+len(rest_raw_action_list)-1:03}_error.jpg"
-                )
-                action_screenshot.save(action_screenshot_path)
-                for rest_raw_action in rest_raw_action_list:
+                if rest_raw_action_list:
+                    error_reason = "Tab id changed" if tab_id_changed else "Last action failed"
+                    error_msg = f"{error_reason}, stop executing the remaining actions"
+                    logger.debug(
+                        f"[Act] {error_reason}, stop executing the remaining {len(rest_raw_action_list)} actions"
+                    )
+                    action_screenshot = await tab_screenshot(cur_tab)
+                    draw_text_label(action_screenshot_draw, text=error_msg, position=(10, 40), font=self.font_18)
+                    result_screenshot_path = action_screenshot_path = (
+                        self.out_dir
+                        / f"{record_prefix}_{action_index:03}-{action_index+len(rest_raw_action_list)-1:03}_error.jpg"
+                    )
+                    action_screenshot.save(action_screenshot_path)
+                    rest_raw_action = rest_raw_action_list[0]
                     action_details_list.append(
                         ActionDetails(
                             raw_action=rest_raw_action,
@@ -768,7 +777,7 @@ User Request:
                             result_screenshot_path=result_screenshot_path,
                         )
                     )
-                break
+                    break
 
         record = ActRecord(
             index=record_index,
