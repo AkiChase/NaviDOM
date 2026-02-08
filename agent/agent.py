@@ -5,6 +5,7 @@ import itertools
 import json
 from pathlib import Path
 import re
+import statistics
 from loguru import logger
 from matplotlib import pyplot as plt
 from playwright.async_api import BrowserContext
@@ -185,7 +186,7 @@ class Agent:
             last_todo_list=last_todo_list,
             agent_history=self.get_formated_progress_history(),
         )
-        llm_detail = await SecondaryLLM.chat_with_text_detail(prompt)
+        llm_detail = await PrimaryLLM.chat_with_text_detail(prompt)
         content = "\n".join(line for line in llm_detail["content"].splitlines() if line.strip())
         all_done = content.find("IN PROGRESS") == -1 and content.find("NOT STARTED") == -1
         repr = content
@@ -231,7 +232,7 @@ class Agent:
                 last_requested_data_found=req_data_found,
                 html=dom_repr,
             )
-            llm_detail = await SecondaryLLM.chat_with_image_detail(prompt, screenshot)
+            llm_detail = await PrimaryLLM.chat_with_image_detail(prompt, screenshot)
             time_line.add("llm")
 
             content = llm_detail["content"]
@@ -451,6 +452,7 @@ User Request:
         action_screenshot.save(action_screenshot_path)
         old_tab_info = await self.tab_manager.get_cur_tab_info()
         action_result = await action.execute(cur_tab, self.tab_manager)
+        await asyncio.sleep(1)
         new_tab_info = await self.tab_manager.get_cur_tab_info()
         execute_result: ActionExecuteResult = {
             "success": True,
@@ -541,7 +543,7 @@ User Request:
         # 空间聚类， alpha 高时以像素坐标的距离为主；alpha 低时以DOM结构的距离为主
         # 筛除尺寸过小的无效聚类
         clusters: list[list[DomNode]] = []
-        for c in DomCluster.cluster_construct(interactive_nodes, alpha=0.45, distance_threshold=0.45):
+        for c in DomCluster.cluster_construct(interactive_nodes, alpha=0.45, max_clusters=5):
             rect = DomCluster.cluster_covered_xyxy(c, viewport)
             w, h = rect[2] - rect[0], rect[3] - rect[1]
             min_side = min(w, h)
@@ -713,6 +715,17 @@ User Request:
                 action_result = str(e)
                 action_error = e
                 action = None
+                # draw action target
+                if isinstance(action_error.extra, DomNode):
+                    action_error.extra.draw_bounds(
+                        action_screenshot_draw,
+                        outline="red",
+                        width=3,
+                        draw_id=True,
+                        recursive=False,
+                        max_bounds=True,
+                    )
+                    action_screenshot.save(action_screenshot_path)  # overwrite
             except ActionExecuteException as e:
                 assert action is not None
                 logger.warning(f"[Act] Execute {action.type.value} action failed. Action: {raw_action}. Error: {e}.")
@@ -778,6 +791,7 @@ User Request:
                         )
                     )
                     break
+        await asyncio.sleep(1)
 
         record = ActRecord(
             index=record_index,
@@ -841,6 +855,7 @@ User Request:
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
                         },
+                        "response_time": round(record.llm_details["total_time"], 4),
                         "time_cost": round(record.time_line.total_time(), 4),
                         "time_point": record.time_line.endpoint(),
                     }
@@ -857,6 +872,7 @@ User Request:
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
                         },
+                        "response_time": round(record.llm_details["total_time"], 4),
                     }
                 )
             elif isinstance(record, PlanningRecord):
@@ -876,6 +892,7 @@ User Request:
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
                         },
+                        "response_time": round(record.llm_details["total_time"], 4),
                     }
                 )
             elif isinstance(record, ExtractionRecord):
@@ -890,6 +907,7 @@ User Request:
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
                         },
+                        "response_time": round(record.llm_details["total_time"], 4),
                     }
                 )
             elif isinstance(record, FeedbackRecord):
@@ -904,31 +922,43 @@ User Request:
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
                         },
+                        "response_time": round(record.llm_details["total_time"], 4),
                     }
                 )
 
-        time_cost = {
-            "total_time": round(total_time_cost, 4),
-            "act_time": 0,
-            "observation_time": 0,
-            "planning_time": 0,
-            "extraction_time": 0,
-            "feedback_time": 0,
-        }
-        for record in self.records:
-            if isinstance(record, ActRecord):
-                time_cost["act_time"] += record.time_line.total_time()
-            elif isinstance(record, ObservationRecord):
-                time_cost["observation_time"] += record.time_line.total_time()
-            elif isinstance(record, PlanningRecord):
-                time_cost["planning_time"] += record.time_line.total_time()
-            elif isinstance(record, ExtractionRecord):
-                time_cost["extraction_time"] += record.time_line.total_time()
-            elif isinstance(record, FeedbackRecord):
-                time_cost["feedback_time"] += record.time_line.total_time()
+            total_time_values = defaultdict(list)
+            response_time_values = defaultdict(list)
 
-        for key in ("act_time", "observation_time", "planning_time", "extraction_time", "feedback_time"):
-            time_cost[key] = round(time_cost[key], 4)
+            for record in self.records:
+                t = record.time_line.total_time()
+
+                if isinstance(record, ActRecord):
+                    total_time_values["act"].append(t)
+                    response_time_values["act"].append(record.llm_details["total_time"])
+                elif isinstance(record, ObservationRecord):
+                    total_time_values["observation"].append(t)
+                    response_time_values["observation"].append(record.llm_details["total_time"])
+                elif isinstance(record, PlanningRecord):
+                    total_time_values["planning"].append(t)
+                    response_time_values["planning"].append(record.llm_details["total_time"])
+                elif isinstance(record, ExtractionRecord):
+                    total_time_values["extraction"].append(t)
+                    response_time_values["extraction"].append(record.llm_details["total_time"])
+                elif isinstance(record, FeedbackRecord):
+                    total_time_values["feedback"].append(t)
+                    response_time_values["feedback"].append(record.llm_details["total_time"])
+
+            time_cost = {}
+            for k in total_time_values.keys():
+                for suffix, values in {"total": total_time_values, "response": response_time_values}.items():
+                    time_cost[f"{k}_{suffix}"] = {
+                        "sum": round(sum(values[k]), 2),
+                        "median": round(statistics.median(values[k]), 2),
+                        "mean": round(statistics.mean(values[k]), 2),
+                        "max": round(max(values[k]), 2),
+                        "min": round(min(values[k]), 2),
+                    }
+            time_cost["total_time"] = round(total_time_cost, 2)
 
         out = {
             "user_request": user_request,
@@ -991,34 +1021,44 @@ User Request:
                 break
 
         report_lines.append("")
-        # Time cost
         counter = defaultdict(int)
         for record in records:
             counter[record["type"]] += 1
-        report_lines.append("### Time Cost (seconds)")
+        planning_times = counter["planning"]
+
+        # Time cost
+        report_lines.append("### Time Cost (Response/Total in seconds)")
         report_lines.append("")
-        report_lines.append("| Type | Count | Time | Avg Time |")
-        report_lines.append("|------|-------|------|----------|")
+        report_lines.append("| Type | Count | Sum | Mean | Median | Min | Max |")
+        report_lines.append("|------|-------|-------|------|--------|-----|-----|")
         report_lines.append(
-            f"| Total | {counter["planning"]} | {time_cost['total_time']} | {time_cost['total_time'] / counter["planning"]:.4f} |"
+            f"| Total | {planning_times} | {time_cost['total_time']} | {time_cost['total_time'] / planning_times:.4f} | - | - | - |"
         )
         type_names = ("planning", "extraction", "feedback", "act", "observation")
         for type_name in type_names:
-            if counter[type_name] == 0:
+            t_type_name = f"{type_name}_total"
+            r_type_name = f"{type_name}_response"
+            if t_type_name not in time_cost or r_type_name not in time_cost:
                 continue
-            time_key = type_name + "_time"
+
+            r_item = time_cost[r_type_name]
+            t_item = time_cost[t_type_name]
             report_lines.append(
-                f"| {type_name.title()} | {counter[type_name]} | {time_cost[time_key]} | {time_cost[time_key] / counter[type_name]:.4f} |"
+                f"| {type_name.title()} | {counter[type_name]} "
+                f"| {r_item['sum']:.2f} / {t_item['sum']:.2f} "
+                f"| {r_item['mean']:.2f} / {t_item['mean']:.2f} "
+                f"| {r_item['median']:.2f} / {t_item['median']:.2f} "
+                f"| {r_item['min']:.2f} / {t_item['min']:.2f} "
+                f"| {r_item['max']:.2f} / {t_item['max']:.2f} |"
             )
         report_lines.append("")
         # Ganntt Chart
-        # 甘特图
         global_start = min(r["time_point"][0] for r in records)
-        global_end = max(r["time_point"][1] for r in records)
+        global_end = max(r["time_point"][-1] for r in records)
         ganntt_spans = []
         for index, r in enumerate(records):
             start = r["time_point"][0] - global_start
-            end = r["time_point"][1] - global_start
+            end = r["time_point"][-1] - global_start
             ganntt_spans.append(
                 {
                     "index": index,
@@ -1098,10 +1138,12 @@ User Request:
         for idx, record in enumerate(records, start=1):
             record_type = record["type"]
             token_usage = record["token_usage"]
+            response_time = record["response_time"]
             # Act Record
             if record_type == "act":
                 report_lines.append(f"### {idx}. Act")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(
                     f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
                 )
@@ -1136,6 +1178,7 @@ User Request:
             elif record_type == "observation":
                 report_lines.append(f"### {idx}. Observation")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(
                     f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
                 )
@@ -1147,6 +1190,7 @@ User Request:
             elif record_type == "planning":
                 report_lines.append(f"### {idx}. Planning")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(
                     f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
                 )
@@ -1162,6 +1206,7 @@ User Request:
             elif record_type == "feedback":
                 report_lines.append(f"### {idx}. Feedback")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(
                     f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
                 )
@@ -1172,6 +1217,7 @@ User Request:
             # Extraction Record
             elif record_type == "extraction":
                 report_lines.append(f"### {idx}. Extraction")
+                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
                 report_lines.append(
                     f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"

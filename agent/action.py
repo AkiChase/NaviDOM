@@ -38,7 +38,7 @@ all_action_types = list(ActionType)
 action_format_prompt = {
     ActionType.Click: "CLICK, <node_id>",
     ActionType.Input: "INPUT, <node_id>, <clear:true|false>, <text>\t// Focus and input <text> into the specified input or textarea node. In <text>, only \\n has special meaning for line breaks; no other escaping is required",
-    ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>. Minimum scroll increment is 0.1 pages",
+    ActionType.Scroll: "SCROLL, <direction>, <pages>\t// Scroll by <pages:float> viewport-height pages in the given <direction:up|down>, based on **Current Visible Tab scroll info**. Minimum scroll increment is 0.1 pages",
     ActionType.SelectOption: "SELECT_OPTION, <select_node_id>, <option_node_id>[, ...]\t// Select option(s) in a <select> HTML element (Exclusive to <select> nodes only; invalid for other node types). Single-select: exactly one <option_node_id>. Multi-select: multiple <option_node_id>s separated by commas",
     # ActionType.Press: "PRESS, <key>\t// Must follow KeyboardEvent.key (e.g. a, Enter, Control+o)",
     ActionType.TabSwitch: "TAB_SWITCH, <tab_id>\t// Switch to the specified tab making it the active and visible tab",
@@ -121,7 +121,10 @@ class Action:
                 text = text[1:-1]
             target = find_target(sub_parts[0])
             if not target.editable:
-                raise ActionParseException(f"Target node {target.get_description(full=False)} is not editable")
+                raise ActionParseException(
+                    f"Target node {target.get_description(full=False)} is not editable, INPUT action must target an input or textarea element",
+                    extra=target,
+                )
             return Action(
                 uid,
                 action_type,
@@ -153,7 +156,9 @@ class Action:
             option_node_ids = [int(id.strip("[]<>")) for id in sub_parts[1:]]
             target = find_target(sub_parts[0])
             if target.tag != "select":
-                raise ActionParseException(f"Target node {target.get_description(full=False)} is not a select node")
+                raise ActionParseException(
+                    f"Target node {target.get_description(full=False)} is not a select node", extra=target
+                )
             options = target.find_children_by_local_ids(option_node_ids)
             errors = []
             values = []
@@ -233,7 +238,6 @@ class Action:
                         result = f"Warning! Target node is a select element, CLICK did not work, you should only use SELECT_OPTION instead."
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
-                await asyncio.sleep(1)
             elif self.type == ActionType.Input:
                 clear = self.extra["clear"]
                 text = self.extra["text"]
@@ -242,10 +246,12 @@ class Action:
                         await loc.fill(text, timeout=5000)
                     else:
                         await loc.type(text, timeout=5000)
-                    await loc.press("Enter")
+                    try:
+                        await loc.press("Enter", timeout=1000)
+                    except:
+                        pass
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
-                await asyncio.sleep(1)
             elif self.type == ActionType.SelectOption:
                 options: list[str] = self.extra["options"]
                 try:
@@ -255,7 +261,6 @@ class Action:
                         await loc.select_option(value=options, timeout=5000)
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to select option: {e}")
-                await asyncio.sleep(1)
         elif self.type == ActionType.Scroll:
             pages = self.extra["pages"]
             dy = Config.browser_viewport_h * pages
@@ -271,11 +276,9 @@ class Action:
         elif self.type == ActionType.Navigate:
             url = self.extra["url"]
             await tab.goto(url)
-            await asyncio.sleep(1)
         elif self.type == ActionType.Search:
             keywords = self.extra["keywords"]
             await tab.goto(bing_search_url(keywords))
-            await asyncio.sleep(1)
         elif self.type == ActionType.TabSwitch:
             tab_id = self.extra["tab_id"]
             if tab_id == tab_manager.cur_tab_id:
@@ -287,14 +290,12 @@ class Action:
             tab = tab_manager.tab_dict[tab_id]
             tab_manager.cur_tab_id = tab_id
             await tab.bring_to_front()
-            await asyncio.sleep(0.5)
         elif self.type == ActionType.TabClose:
             tab_id = self.extra["tab_id"]
             if tab_id not in tab_manager.tab_dict:
                 raise ActionExecuteException(f"Tab ID {tab_id} not found")
             tab = tab_manager.tab_dict[tab_id]
             await tab.close()
-            await asyncio.sleep(0.5)
         elif self.type == ActionType.WAIT:
             seconds = self.extra["seconds"]
             await asyncio.sleep(seconds)

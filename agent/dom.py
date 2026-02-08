@@ -57,9 +57,16 @@ class Viewport:
         return max(remaining_height / self.height, 0.0)
 
     def get_viewport_scroll_info(self) -> str:
-        up = self.remaining_up_pages
-        down = self.remaining_down_pages
-        return f"Current Visible Tab scroll info: can scroll up {up:.1f} pages, down {down:.1f} pages"
+        if self.remaining_up_pages >= 0.1:
+            up_info = f"can scroll up 0.1 to {self.remaining_up_pages:.1f} pages"
+        else:
+            up_info = "cannot scroll up"
+        if self.remaining_down_pages >= 0.1:
+            down_info = f"can scroll down 0.1 to {self.remaining_down_pages:.1f} pages"
+        else:
+            down_info = "cannot scroll down"
+
+        return f"Current Visible Tab scroll info: {up_info}, {down_info}"
 
 
 default_font = ImageFont.load_default()
@@ -369,7 +376,7 @@ class DomNode:
 
 
 # Interactive Elements
-GROUP_ELEMENTS = {"a", "button", "input", "textarea", "select", "form", "checkbox", "dialog"}
+GROUP_ELEMENTS = {"a", "button", "input", "textarea", "select", "checkbox", "dialog"}
 GROUP_ELEMENT_ROLES = {"button", "checkbox", "radio", "switch", "textbox", "combobox", "listbox", "dialog"}
 FORCE_REMOVE_ELEMENTS = {"script", "style", "meta", "link", "title"}
 SUPPORT_ELEMENTS = {
@@ -657,19 +664,19 @@ class DomState:
                                 "right": min(viewport.width, root.bounds.x + root.bounds.width + root.bounds.offset_x),
                             }
                             new_res = await target_frame.evaluate(load_script, frame_viewport)
-                            new_dom_node_list = await DomNode.from_raw(
-                                new_res["dom"],
-                                start_local_id=next_local_id,
-                            )
-                            next_local_id = new_dom_node_list[-1].local_id + 1
-                            new_dom_root = new_dom_node_list[0]
-                            root.children = [new_dom_root]
-                            new_dom_root.parent = root
-                            await recur(new_dom_root, target_frame, root.local_id)
-                            return
-
-            for child in root.children:
-                await recur(child, parent_frame, parent_frame_id)
+                            if new_res["dom"] is not None:
+                                new_dom_node_list = await DomNode.from_raw(
+                                    new_res["dom"],
+                                    start_local_id=next_local_id,
+                                )
+                                next_local_id = new_dom_node_list[-1].local_id + 1
+                                new_dom_root = new_dom_node_list[0]
+                                root.children = [new_dom_root]
+                                new_dom_root.parent = root
+                                await recur(new_dom_root, target_frame, root.local_id)
+            else:
+                for child in root.children:
+                    await recur(child, parent_frame, parent_frame_id)
 
         await recur(dom_root, tab.main_frame, -1)
 
@@ -679,12 +686,12 @@ class DomState:
 class DomCluster:
     @staticmethod
     def cluster_construct(
-        nodes: list[DomNode], alpha: float = 0.5, distance_threshold: float = 0.5
+        nodes: list[DomNode], alpha: float = 0.5, max_clusters: int = 5
     ) -> list[list[DomNode]]:
         """
         - nodes: 可交互节点列表
         - alpha: 空间距离权重 (0~1) DOM树距离权重 (1-alpha)
-        - distance_threshold: 聚类阈值（用于划分簇，取决于归一化距离）
+        - max_clusters: 最大聚类数
         """
 
         n = len(nodes)
@@ -728,7 +735,7 @@ class DomCluster:
         combined_dist = np.maximum(combined_dist, 0.0)
         # 层次聚类
         z = linkage(squareform(combined_dist), method="average")
-        labels: np.ndarray = fcluster(z, t=distance_threshold, criterion="distance")
+        labels: np.ndarray = fcluster(z, t=max_clusters, criterion="maxclust")
 
         clusters: defaultdict[int, list[DomNode]] = defaultdict(list)
         for node, label in zip(nodes, labels):

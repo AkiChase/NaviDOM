@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import platform
 import re
-from typing import Union, Tuple
+from typing import Any, Union, Tuple
 import uuid
 from PIL import ImageDraw, ImageFont, Image
 from loguru import logger
@@ -13,8 +13,11 @@ from urllib.parse import quote
 
 
 class SpecialException(Exception):
-    def __init__(self, message: str) -> None:
+    extra: Any
+
+    def __init__(self, message: str, extra: Any = None) -> None:
         super().__init__(message)
+        self.extra = extra
 
     def __str__(self) -> str:
         return self.args[0]
