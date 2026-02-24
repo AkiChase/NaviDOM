@@ -4,7 +4,7 @@ import shutil
 import sys
 from loguru import logger
 
-from agent.llm import PrimaryLLM, SecondaryLLM
+from agent.llm import LLMs
 
 
 class Config:
@@ -37,22 +37,9 @@ class Config:
         cls.browser_viewport_h = viewport.get("height", 720)
         cls.max_iteration_times = env.get("max_iteration_times", 10)
 
-        primary_llm_service = env["primary_llm_service"]
-        secondary_llm_service = env["secondary_llm_service"]
-        primary_llm_config = env[primary_llm_service]
-        secondary_llm_config = env[secondary_llm_service]
-
-        PrimaryLLM.init(
-            api_key=primary_llm_config["api_key"],
-            base_url=primary_llm_config["base_url"],
-            temperature=primary_llm_config["temperature"],
-            text_model=primary_llm_config["text_model"],
-            image_model=primary_llm_config["image_model"],
-        )
-        SecondaryLLM.init(
-            api_key=secondary_llm_config["api_key"],
-            base_url=secondary_llm_config["base_url"],
-            temperature=primary_llm_config["temperature"],
-            text_model=secondary_llm_config["text_model"],
-            image_model=secondary_llm_config["image_model"],
+        LLMs.init(
+            vlm_primary_config=env[env["vlm_primary_service"]],
+            llm_primary_config=env[env["llm_primary_service"]],
+            vlm_secondary_config=env[env["vlm_secondary_service"]],
+            llm_secondary_config=env[env["llm_secondary_service"]],
         )

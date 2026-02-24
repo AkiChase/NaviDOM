@@ -87,16 +87,26 @@ class TabManager:
     @staticmethod
     def compare_tab_info(new_tab_info: dict, old_tab_info: dict) -> str | None:
         if new_tab_info["tab_id"] != old_tab_info["tab_id"]:
-            return "Tab switched, ID {} -> {}".format(old_tab_info["tab_id"], new_tab_info["tab_id"])
-        info = "Tab not switched."
-        changed = False
-        if new_tab_info["title"] != old_tab_info["title"]:
-            info += " Title '{}' -> '{}'.".format(old_tab_info["title"], new_tab_info["title"])
-            changed = True
-        if new_tab_info["url"] != old_tab_info["url"]:
-            info += " URL '{}' -> '{}'.".format(old_tab_info["url"], new_tab_info["url"])
-            changed = True
-        return info if changed else None
+            return "Tab switched: " f"tab_id {old_tab_info['tab_id']} → {new_tab_info['tab_id']}."
+
+        old_title, new_title = old_tab_info["title"], new_tab_info["title"]
+        old_url, new_url = old_tab_info["url"], new_tab_info["url"]
+
+        messages = []
+        if old_url != new_url:
+            messages.append(
+                f"Tab URL changed from '{old_url}' to '{new_url}', indicating navigation within the same tab."
+            )
+
+        if old_title != new_title:
+            messages.append(
+                f"Tab title changed from '{old_title}' to '{new_title}', indicating a possible change in page content or state."
+            )
+
+        if not messages:
+            return None
+
+        return "Tab not switched." + " ".join(messages)
 
     @property
     def front_tab(self) -> Page:

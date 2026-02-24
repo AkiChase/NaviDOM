@@ -5,6 +5,7 @@ import itertools
 import json
 from pathlib import Path
 import re
+import shutil
 import statistics
 from loguru import logger
 from matplotlib import pyplot as plt
@@ -21,7 +22,7 @@ from agent.action import (
 )
 from agent.config import Config
 from agent.dom import DomCluster, DomNode, DomState, Viewport
-from agent.llm import ChatImageDetails, PrimaryLLM, SecondaryLLM
+from agent.llm import ChatImageDetails, LLMs
 from agent.record import (
     ActRecord,
     ExtractionRecord,
@@ -58,6 +59,7 @@ class Agent:
     last_extraction_record: ExtractionRecord | None
     last_feedback_record: FeedbackRecord | None
     progress: list[str]
+    iteration_times: int
 
     def __init__(self, out_dir: Path, context: BrowserContext, user_request: str):
         self.prompts_dict = load_prompts()
@@ -66,6 +68,10 @@ class Agent:
         self.out_dir = out_dir
         self.user_request = user_request
         self.font_18 = load_default_font(18)
+
+    async def _reset(self):
+        # close all tabs
+        await self.tab_manager.reset_context_tabs()
         self.records = []
         self.last_planning_record = None
         self.last_act_record = None
@@ -73,8 +79,16 @@ class Agent:
         self.last_extraction_record = None
         self.last_feedback_record = None
         self.progress = []
+        self.iteration_times = 0
 
-        out_dir.mkdir(parents=True, exist_ok=True)
+        if self.out_dir.exists():
+            shutil.rmtree(self.out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_remaining_action_budget(self) -> str:
+        remaining = Config.max_iteration_times - self.iteration_times
+        percent = remaining / Config.max_iteration_times
+        return f"{remaining} ({percent:.2%} of {Config.max_iteration_times})"
 
     def get_formated_progress_history(self) -> str:
         if not self.progress:
@@ -82,9 +96,9 @@ class Agent:
         return "\n".join(self.progress)
 
     async def run(self, start_url: str | None = None):
+        await self._reset()
         start_time = datetime.now()
-        # close all tabs
-        await self.tab_manager.reset_context_tabs()
+
         if start_url:
             logger.info(f"[Run] Start with URL: {start_url}")
             await self.tab_manager.front_tab.goto(start_url)
@@ -97,40 +111,47 @@ class Agent:
         # 初次规划
         extraction_task = await self.planning()
 
-        iteration_times = 0
         while True:
-            iteration_times += 1
             assert self.last_planning_record is not None
-            if self.last_planning_record.task_completed:
+            if self.last_planning_record.task_state_flag != "TASK_ONGOING":
                 # ensure extraction and feedback task is done
                 feedback_task = await extraction_task
                 await feedback_task
                 assert self.last_feedback_record is not None
-                if self.last_feedback_record.all_done:
-                    logger.success(f"[Planning] Task completed")
+
+                if self.last_planning_record.task_state_flag == "TASK_FAILED":
+                    logger.error(f"[Planning] Task failed")
                     break
-                else:
-                    logger.warning(f"[Feedback] Task not completed")
-                    extraction_task = await self.planning()
-                    if self.last_planning_record.task_completed:
-                        feedback_task = await extraction_task
-                        await feedback_task
+                elif self.last_planning_record.task_state_flag == "TASK_FULLY_FINISHED":
+                    if self.last_feedback_record.all_done:
                         logger.success(f"[Planning] Task completed")
                         break
+                    else:
+                        logger.warning(f"[Feedback] Task not fully completed. Re-planning is required.")
+                        extraction_task = await self.planning()
+                        if self.last_planning_record.task_state_flag != "TASK_ONGOING":
+                            feedback_task = await extraction_task
+                            await feedback_task
+                            if self.last_planning_record.task_state_flag == "TASK_FAILED":
+                                logger.error(f"[Planning] Task failed (re-planning)")
+                            elif self.last_planning_record.task_state_flag == "TASK_FULLY_FINISHED":
+                                logger.success(f"[Planning] Task completed (re-planning)")
+                            else:
+                                raise ValueError(
+                                    f"Unknown task state flag: {self.last_planning_record.task_state_flag}"
+                                )
+                            break
+                else:
+                    raise ValueError(f"Unknown task state flag: {self.last_planning_record.task_state_flag}")
 
-            if iteration_times > Config.max_iteration_times:
+            if self.iteration_times >= Config.max_iteration_times:
                 # ensure extraction and feedback task is done
                 feedback_task = await extraction_task
                 await feedback_task
-
                 logger.warning(
-                    f"[Planning] Max iteration times reached, stop: {iteration_times-1}/{Config.max_iteration_times}"
+                    f"[Planning] Max iteration times reached, stop: {self.iteration_times}/{Config.max_iteration_times}"
                 )
                 break
-
-            # TODO 可以考虑加入剩余可执行步数的反馈
-            # TODO 迭代次数加入self和result中
-            # TODO 可以考虑Observation给出明确的3种标签，这对用户反馈会更有意义一点
 
             before_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
             # Act
@@ -140,6 +161,8 @@ class Agent:
             # Planning
             await extraction_task  # ensure extraction task (of last planning) is done before next planning
             # TODO 如果progress过长（token达到某个阈值？）后可以在背景任务中提取有效、去除重复（相对user request)的progress（记录旧的长度，提取成功后，将旧的那几条替换成新的）
+            # 可以考虑用两条：做过什么，获取到了什么用户需要的数据
+            self.iteration_times += 1
             extraction_task = await self.planning()
 
         end_time = datetime.now()
@@ -186,8 +209,8 @@ class Agent:
             last_todo_list=last_todo_list,
             agent_history=self.get_formated_progress_history(),
         )
-        llm_detail = await PrimaryLLM.chat_with_text_detail(prompt)
-        content = "\n".join(line for line in llm_detail["content"].splitlines() if line.strip())
+        llm_detail = await LLMs.llm_secondary.chat_with_text_detail(prompt)
+        content = "\n".join(line for line in llm_detail["content"].splitlines() if line.strip())  # remove empty lines
         all_done = content.find("IN PROGRESS") == -1 and content.find("NOT STARTED") == -1
         repr = content
         status_emoji = {
@@ -198,8 +221,9 @@ class Agent:
         for k, v in status_emoji.items():
             repr = repr.replace(k, f"{v} {k}")
 
-        logger.info(f"[Feedback] Detail:\n{repr}")
+        logger.debug(f"[Feedback] Reasoning {llm_detail["total_time"]:.2f}s")
         time_line.add("llm")
+        logger.info(f"[Feedback] Detail:\n{repr}")
 
         record = FeedbackRecord(
             index=record_index,
@@ -232,7 +256,8 @@ class Agent:
                 last_requested_data_found=req_data_found,
                 html=dom_repr,
             )
-            llm_detail = await PrimaryLLM.chat_with_image_detail(prompt, screenshot)
+            llm_detail = await LLMs.vlm_secondary.chat_with_image_detail(prompt, screenshot)
+            logger.debug(f"[Extraction] Reasoning {llm_detail["total_time"]:.2f}s")
             time_line.add("llm")
 
             content = llm_detail["content"]
@@ -260,13 +285,14 @@ class Agent:
         self.records.append(Record(record_index, time_line))
         record_prefix = f"{record_index:03}_planning"
         logger.info(f"[{record_index:03}] Planning")
-
+        remaining_action_budget = self.get_remaining_action_budget()
+        logger.info(f"[Planning] Remaining action budget: {remaining_action_budget}")
         if self.last_planning_record is None:
             last_task_state = "The first Planning. No Last Task State."
             last_act_goal = "The first Planning. No Last Act Goal."
             last_planning = f"- Task State: {last_task_state}\n- Act Goal: {last_act_goal}"
         else:
-            if self.last_planning_record.task_completed:
+            if self.last_planning_record.task_state == "TASK_FULLY_FINISHED":
                 assert self.last_feedback_record is not None
                 last_planning = (
                     "Previous Planning step concluded that the task (User Request) was fully finished, "
@@ -304,6 +330,7 @@ class Agent:
             last_act=last_act,
             last_act_observation=last_act_observation,
             current_tabs=current_tabs,
+            remaining_action_budget=remaining_action_budget,
         )
 
         new_progress_pattern = re.compile(r"New Progress:\s*(.*?)\s*Requested Data Found:", re.DOTALL)
@@ -332,9 +359,10 @@ class Agent:
         )
         final_screenshot_path = self.out_dir / f"{record_prefix}.jpg"
         final_screenshot.save(final_screenshot_path)
-        llm_details = await PrimaryLLM.chat_with_image_detail(
+        llm_details = await LLMs.vlm_primary.chat_with_image_detail(
             prompt, final_screenshot, hook=hook_extraction_and_feedback
         )
+        logger.debug(f"[Planning] Reasoning {llm_details["total_time"]:.2f}s")
         time_line.add("llm")
 
         content = llm_details["content"]
@@ -346,7 +374,12 @@ class Agent:
         assert requested_data_found is not None, "Failed to parse expected Requested Data Found in LLM response"
         assert task_state is not None, "Failed to parse expected Task State in LLM response"
         assert act_goal is not None, "Failed to parse expected Act Goal in LLM response"
-        task_completed = "TASK_FULLY_FINISHED" in task_state or "TASK_FULLY_FINISHED" in act_goal
+
+        task_state_flag = "TASK_ONGOING"
+        for kw in ["TASK_ONGOING", "TASK_FULLY_FINISHED"]:
+            if kw in task_state or kw in act_goal:
+                task_state_flag = kw
+                break
 
         logger.debug(f"[Planning][Task State] {task_state}")
         logger.debug(f"[Planning][Act Goal] {act_goal}")
@@ -359,9 +392,10 @@ class Agent:
             requested_data_found=requested_data_found,
             task_state=task_state,
             act_goal=act_goal,
-            task_completed=task_completed,
+            task_state_flag=task_state_flag,
             screenshot_path=final_screenshot_path,
             time_line=time_line,
+            remaining_action_budget=remaining_action_budget,
         )
         record.save(self.out_dir)
         self.records[record_index] = record
@@ -380,28 +414,43 @@ class Agent:
         after_act_screenshot = await tab_screenshot(self.tab_manager.front_tab)
         actions_info = self.last_act_record.get_actions_descriptions()
 
-        if Config.debug:
-            record_prefix = f"{record_index:03}_observation"
-            before_act_screenshot.save(self.out_dir / f"{record_prefix}_debug_before.jpg")
-            after_act_screenshot.save(self.out_dir / f"{record_prefix}_debug_after.jpg")
+        record_prefix = f"{record_index:03}_observation"
+        screenshot_path = self.out_dir / f"{record_prefix}_after.jpg"
+        after_act_screenshot.save(screenshot_path)
 
         time_line.add("fetch")
         prompt = self.prompts_dict["observation"].format(
             act_goal=self.last_act_record.act_goal,
-            action_execution_description=actions_info,
+            act_execution_details=actions_info,
         )
-        llm_details = await SecondaryLLM.chat_with_image_list_detail(
+        llm_details = await LLMs.vlm_secondary.chat_with_image_list_detail(
             prompt, [before_act_screenshot, after_act_screenshot]
         )
         observation = llm_details["content"]
-        logger.debug(f"[Observation] {llm_details['content']}")
+        # extract fields
+        judgment_pattern = re.compile(r"Judgment:\s*(.*?)\s*$", re.DOTALL)
+        judgment = self.parse_response(observation, [judgment_pattern])[0]
+
+        emoji = "❓️"
+        if judgment is not None:
+            # Yes/Partial/No
+            if judgment.lower().find("yes") != -1:
+                emoji = "✅"
+            elif judgment.lower().find("no") != -1:
+                emoji = "❌"
+            elif judgment.lower().find("partial") != -1:
+                emoji = "⌛️"
+        logger.debug(f"[Observation] Reasoning {llm_details["total_time"]:.2f}s")
         time_line.add("llm")
+        logger.debug(f"[Observation] {emoji}\n{observation}")
 
         time_line.add("end")
         record = ObservationRecord(
             index=record_index,
             llm_details=llm_details,
             observation=observation,
+            judgment=emoji,
+            screenshot_path=screenshot_path,
             time_line=time_line,
         )
         record.save(self.out_dir)
@@ -437,7 +486,8 @@ User Request:
         action_prefix = f"{record_prefix}_{action_index:03}_{action_uid}"
         logger.info(f"[{record_index:03}] Act")
 
-        llm_details = await SecondaryLLM.chat_with_text_detail(prompt)
+        llm_details = await LLMs.llm_primary.chat_with_text_detail(prompt)
+        logger.debug(f"[Act] Reasoning {llm_details["total_time"]:.2f}s")
         time_line.add("llm")
         raw_action = llm_details["content"]
         action = Action.from_raw_action(
@@ -474,7 +524,7 @@ User Request:
         time_line.add(f"execute_{action_index:03}")
         pruning_details: PruningDetails = {
             "time": 0,
-            "model": SecondaryLLM.image_model,
+            "model": LLMs.vlm_secondary.model,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "result": [],
@@ -646,7 +696,7 @@ User Request:
         pruning_completion_tokens = sum(detail["completion_tokens"] for detail in llm_detail_list)
         pruning_details: PruningDetails = {
             "time": time_line.content[-1][1] - time_line.content[-2][1],
-            "model": SecondaryLLM.image_model,
+            "model": LLMs.vlm_secondary.model,
             "prompt_tokens": pruning_prompt_tokens,
             "completion_tokens": pruning_completion_tokens,
             "result": flags,
@@ -667,7 +717,8 @@ User Request:
             interactive_nodes=interactive_nodes_repr,
         )
 
-        llm_action_detail = await PrimaryLLM.chat_with_image_detail(prompt, final_screenshot)
+        llm_action_detail = await LLMs.vlm_primary.chat_with_image_detail(prompt, final_screenshot)
+        logger.debug(f"[Act] Reasoning {llm_action_detail["total_time"]:.2f}s")
         time_line.add("llm")
         llm_action_res = llm_action_detail["content"]
 
@@ -808,23 +859,29 @@ User Request:
 
     def save_result(self, total_time_cost: float):
         user_request = self.user_request
-        token = PrimaryLLM.token_dict
-        for k, v in SecondaryLLM.token_dict.items():
-            if k not in token:
-                token[k] = v
-            else:
-                token[k]["completion_tokens"] += v["completion_tokens"]
-                token[k]["prompt_tokens"] += v["prompt_tokens"]
-                token[k]["total_tokens"] += v["total_tokens"]
+        token = {}
+        for llm in (LLMs.vlm_primary, LLMs.llm_primary, LLMs.vlm_secondary, LLMs.llm_secondary):
+            for k, v in llm.token_dict.items():
+                if k not in token:
+                    token[k] = v
+                else:
+                    token[k]["completion_tokens"] += v["completion_tokens"]
+                    token[k]["prompt_tokens"] += v["prompt_tokens"]
+                    token[k]["total_tokens"] += v["total_tokens"]
 
-        success = self.last_planning_record is not None and self.last_planning_record.task_completed
-        if success:
-            assert self.last_planning_record is not None
-            task_result = self.last_planning_record.task_state
+        success = (
+            self.last_planning_record is not None and self.last_planning_record.task_state_flag == "TASK_FULLY_FINISHED"
+        )
+        if self.last_planning_record is None:
+            task_result = "TASK_ERROR ❌︎"
         else:
-            task_result = "Task failed."
-            if self.last_planning_record is not None:
-                task_result += f" {self.last_planning_record.task_state}"
+            emoji = {
+                "TASK_FULLY_FINISHED": "✅︎",
+                "TASK_FAILED": "❌︎",
+                "TASK_ONGOING": "⏳",
+            }
+            task_state_flag = self.last_planning_record.task_state_flag
+            task_result = f"{task_state_flag} {emoji[task_state_flag]}.\n{self.last_planning_record.task_state}"
 
         records = []
         for record in self.records:
@@ -850,12 +907,14 @@ User Request:
                             "model": record.pruning_details["model"],
                         },
                         "pruning_token_reduction": record.pruning_details["token_reduction"],
-                        "token_usage": {
+                        "llm_metric": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
+                            "response_time": round(record.llm_details["total_time"], 4),
+                            "tps": round(record.llm_details["tps"], 4),
+                            "ttft": round(record.llm_details["ttft"], 4),
                         },
-                        "response_time": round(record.llm_details["total_time"], 4),
                         "time_cost": round(record.time_line.total_time(), 4),
                         "time_point": record.time_line.endpoint(),
                     }
@@ -865,14 +924,18 @@ User Request:
                     {
                         "type": "observation",
                         "observation": record.observation,
+                        "judgment": record.judgment,
+                        "screenshot_name": record.screenshot_path.name,
                         "time_cost": round(record.time_line.total_time(), 4),
                         "time_point": record.time_line.endpoint(),
-                        "token_usage": {
+                        "llm_metric": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
+                            "response_time": round(record.llm_details["total_time"], 4),
+                            "tps": round(record.llm_details["tps"], 4),
+                            "ttft": round(record.llm_details["ttft"], 4),
                         },
-                        "response_time": round(record.llm_details["total_time"], 4),
                     }
                 )
             elif isinstance(record, PlanningRecord):
@@ -883,16 +946,19 @@ User Request:
                         "requested_data_found": record.requested_data_found,
                         "task_state": record.task_state,
                         "act_goal": record.act_goal,
-                        "task_completed": record.task_completed,
+                        "task_state_flag": record.task_state_flag,
+                        "remaining_action_budget": record.remaining_action_budget,
                         "screenshot_name": record.screenshot_path.name,
                         "time_cost": round(record.time_line.total_time(), 4),
                         "time_point": record.time_line.endpoint(),
-                        "token_usage": {
+                        "llm_metric": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
+                            "response_time": round(record.llm_details["total_time"], 4),
+                            "tps": round(record.llm_details["tps"], 4),
+                            "ttft": round(record.llm_details["ttft"], 4),
                         },
-                        "response_time": round(record.llm_details["total_time"], 4),
                     }
                 )
             elif isinstance(record, ExtractionRecord):
@@ -902,12 +968,14 @@ User Request:
                         "data": record.data,
                         "time_cost": round(record.time_line.total_time(), 4),
                         "time_point": record.time_line.endpoint(),
-                        "token_usage": {
+                        "llm_metric": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
+                            "response_time": round(record.llm_details["total_time"], 4),
+                            "tps": round(record.llm_details["tps"], 4),
+                            "ttft": round(record.llm_details["ttft"], 4),
                         },
-                        "response_time": round(record.llm_details["total_time"], 4),
                     }
                 )
             elif isinstance(record, FeedbackRecord):
@@ -917,12 +985,14 @@ User Request:
                         "feedback": record.repr,
                         "time_cost": round(record.time_line.total_time(), 4),
                         "time_point": record.time_line.endpoint(),
-                        "token_usage": {
+                        "llm_metric": {
                             "prompt_tokens": record.llm_details["prompt_tokens"],
                             "completion_tokens": record.llm_details["completion_tokens"],
                             "model": record.llm_details["model"],
+                            "response_time": round(record.llm_details["total_time"], 4),
+                            "tps": round(record.llm_details["tps"], 4),
+                            "ttft": round(record.llm_details["ttft"], 4),
                         },
-                        "response_time": round(record.llm_details["total_time"], 4),
                     }
                 )
 
@@ -1067,15 +1137,15 @@ User Request:
                     "duration": end - start,
                 }
             )
-        # 1. 按 label 分组（每种 label 一行）
+        # 1. group spans by label (one span per line)
         label_to_spans = defaultdict(list)
         for span in ganntt_spans:
             label_to_spans[span["label"]].append(span)
         labels = tuple(reversed(type_names))
-        # 2. 为每种 label 分配一行 y 轴位置
+        # 2. assign a y position to each label
         label_to_y = {label: i for i, label in enumerate(labels)}
-        # 3. 为每种 label 分配一种颜色
-        cmap = plt.get_cmap("tab10")  # 颜色足够区分
+        # 3. use tab10 colormap to assign a color to each label
+        cmap = plt.get_cmap("tab10")
         label_to_color = {label: cmap(i % cmap.N) for i, label in enumerate(labels)}
         label_height = 0.6
         _, ax = plt.subplots(figsize=(max(2, (global_end - global_start) // 20) * 5, len(labels) * label_height * 1))
@@ -1087,9 +1157,9 @@ User Request:
                 duration = span["duration"]
                 end = start + duration
                 index = span["index"]
-                # 4. 绘制甘特条
+                # 4. draw gantt bar (span)
                 ax.barh(y=y, width=duration, left=start, height=label_height, color=color, edgecolor="black", alpha=0.8)
-                # 5. 标记 start、duration、end
+                # 5. mark start, duration, end
                 ax.text(
                     start + duration + 0.1,
                     y,
@@ -1098,7 +1168,7 @@ User Request:
                     va="center",
                     fontsize=8,
                 )
-                # 6. 标记 index（放在条中间）
+                # 6. mark index（place in the middle）
                 ax.text(
                     start + duration / 2,
                     y,
@@ -1126,9 +1196,9 @@ User Request:
         report_lines.append("")
         for record in records:
             if record["type"] == "planning":
-                report_lines.append(f"- {record.get('new_progress', '')}")
+                report_lines.append(f"- {record['new_progress']}")
             if record["type"] == "extraction":
-                report_lines.append(f"- {record.get('data', '')}")
+                report_lines.append(f"- {record['data']}")
         report_lines.append("")
 
         # Part 3: Execution Records
@@ -1137,15 +1207,17 @@ User Request:
 
         for idx, record in enumerate(records, start=1):
             record_type = record["type"]
-            token_usage = record["token_usage"]
-            response_time = record["response_time"]
+            llm_metric = record["llm_metric"]
+
             # Act Record
             if record_type == "act":
                 report_lines.append(f"### {idx}. Act")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
+                    f"- **LLM Metric**: model={llm_metric['model']}, response_time={llm_metric['response_time']}, tps={llm_metric['tps']}, ttft={llm_metric['ttft']}"
+                )
+                report_lines.append(
+                    f"- **Token Usage**: prompt={llm_metric['prompt_tokens']}, completion={llm_metric['completion_tokens']}"
                 )
                 report_lines.append(f"- **Pruning Time**: {record['pruning_time']}s")
                 pruning_tokens = record["pruning_tokens"]
@@ -1163,52 +1235,58 @@ User Request:
                     if action.get("result") is not None:
                         report_lines.append(f"    - **Result**: {action['result']}")
 
-                    # 并排显示截图
                     action_img = f"![Action]({action['action_screenshot_name']})"
                     result_img = f"![Result]({action['result_screenshot_name']})" if action["success"] else ""
                     if action_img and result_img:
-                        # 使用 HTML 表格并排
                         img_html = f"<table><tr><td>{action_img}</td><td>{result_img}</td></tr></table>"
                         report_lines.append(f"    - **Screenshots**: {img_html}")
                     else:
                         report_lines.append(f"    - **Action Screenshot**: {action_img}")
-
                 report_lines.append("")
             # Observation Record
             elif record_type == "observation":
                 report_lines.append(f"### {idx}. Observation")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
+                    f"- **LLM Metric**: model={llm_metric['model']}, response_time={llm_metric['response_time']}, tps={llm_metric['tps']}, ttft={llm_metric['ttft']}"
+                )
+                report_lines.append(
+                    f"- **Token Usage**: prompt={llm_metric['prompt_tokens']}, completion={llm_metric['completion_tokens']}"
                 )
                 report_lines.append("")
-                report_lines.append("**Observation**:")
+                report_lines.append(f"- **Judgment**: {record['judgment']}")
+                report_lines.append("- **Observation**:\n```")
                 report_lines.append(record["observation"])
+                report_lines.append("```")
+                report_lines.append(f"- **Observation Screenshot**: ![Observation]({record['screenshot_name']})")
                 report_lines.append("")
             # Planning Record
             elif record_type == "planning":
                 report_lines.append(f"### {idx}. Planning")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
+                    f"- **LLM Metric**: model={llm_metric['model']}, response_time={llm_metric['response_time']}, tps={llm_metric['tps']}, ttft={llm_metric['ttft']}"
                 )
-                report_lines.append(f"- **Task Completed**: {record['task_completed']}")
-
-                report_lines.append(f"- **New Progress:** {record.get('new_progress', '')}")
-                report_lines.append(f"- **Requested Data Found:** {record.get('requested_data_found', '')}")
-                report_lines.append(f"- **Task State:** {record.get('task_state', '')}")
-                report_lines.append(f"- **Act Goal:** {record.get('act_goal', '')}")
+                report_lines.append(
+                    f"- **Token Usage**: prompt={llm_metric['prompt_tokens']}, completion={llm_metric['completion_tokens']}"
+                )
+                report_lines.append(f"- **Task State Flag**: {record['task_state_flag']}")
+                report_lines.append(f"- **Remaining Action Budget:** {record['remaining_action_budget']}")
+                report_lines.append(f"- **New Progress:** {record['new_progress']}")
+                report_lines.append(f"- **Requested Data Found:** {record['requested_data_found']}")
+                report_lines.append(f"- **Task State:** {record['task_state']}")
+                report_lines.append(f"- **Act Goal:** {record['act_goal']}")
                 report_lines.append(f"- **Planning Screenshot**: ![Planning]({record['screenshot_name']})")
                 report_lines.append("")
             # Feedback Record
             elif record_type == "feedback":
                 report_lines.append(f"### {idx}. Feedback")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
-                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
+                    f"- **LLM Metric**: model={llm_metric['model']}, response_time={llm_metric['response_time']}, tps={llm_metric['tps']}, ttft={llm_metric['ttft']}"
+                )
+                report_lines.append(
+                    f"- **Token Usage**: prompt={llm_metric['prompt_tokens']}, completion={llm_metric['completion_tokens']}"
                 )
                 report_lines.append("")
                 report_lines.append("**Feedback**:")
@@ -1217,10 +1295,12 @@ User Request:
             # Extraction Record
             elif record_type == "extraction":
                 report_lines.append(f"### {idx}. Extraction")
-                report_lines.append(f"- **Response Time**: {response_time}s")
                 report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
                 report_lines.append(
-                    f"- **Token Usage**: prompt={token_usage['prompt_tokens']}, completion={token_usage['completion_tokens']}, model={token_usage['model']}"
+                    f"- **LLM Metric**: model={llm_metric['model']}, response_time={llm_metric['response_time']}, tps={llm_metric['tps']}, ttft={llm_metric['ttft']}"
+                )
+                report_lines.append(
+                    f"- **Token Usage**: prompt={llm_metric['prompt_tokens']}, completion={llm_metric['completion_tokens']}"
                 )
                 report_lines.append("")
                 report_lines.append("**Extraction**:")

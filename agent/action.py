@@ -88,7 +88,13 @@ class Action:
         assert raw_action, "Empty action line"
 
         parts = [p.strip() for p in raw_action.split(",", maxsplit=1)]
-        action_type = ActionType(parts[0].upper())
+        if len(parts) == 1:
+            raise ActionParseException(f"Invalid action format: {raw_action}")
+
+        try:
+            action_type = ActionType(parts[0].upper())
+        except:
+            raise ActionParseException(f"Unknown action type: {parts[0]}")
 
         def find_target(local_id: str) -> DomNode:
             target_id = int(local_id.strip("[]<>"))
@@ -308,7 +314,7 @@ class Action:
         #     subject = self.extra["subject"]
         #     text_content = dom.convert_to_repr_node(skip_omit=True).get_human_tree_repr()
         #     prompt = f"Extract the content strictly related to {subject} from the following HTML, ignoring HTML tags, and present it as a concise paragraph:\n{text_content}"
-        #     llm_detail = await SecondaryLLM.chat_with_text_detail(prompt)
+        #     llm_detail = await LLMs.llm_primary.chat_with_text_detail(prompt)
         #     memory.append(llm_detail["content"])
         #     return llm_detail
         else:

@@ -51,8 +51,9 @@ class PlanningRecord(Record):
     requested_data_found: str | None
     task_state: str
     act_goal: str
-    task_completed: bool
+    task_state_flag: str # TASK_FULLY_FINISHED, TASK_FAILED, TASK_ONGOING
     screenshot_path: Path
+    remaining_action_budget: str
 
     def save(self, out_dir: Path):
         super().save(
@@ -64,7 +65,8 @@ class PlanningRecord(Record):
                 "requested_data_found": self.requested_data_found,
                 "task_state": self.task_state,
                 "act_goal": self.act_goal,
-                "task_completed": self.task_completed,
+                "task_state_flag": self.task_state_flag,
+                "remaining_action_budget": self.remaining_action_budget,
                 "screenshot_path": str(self.screenshot_path),
                 "time_line": self.time_line.to_dict(),
             },
@@ -129,9 +131,9 @@ class ActRecord(Record):
         for index, action_details in enumerate(self.action_details_list, 1):
             actions_info.append(f"{index}.")
             if action_details.action is not None:
-                actions_info.append(f"- Describe: {action_details.action.get_description()}")
-            else: 
-                actions_info.append(f"- Not Executed. Raw Action: {action_details.raw_action}")
+                actions_info.append(f"- Action: {action_details.action.get_description()}")
+            else:
+                actions_info.append(f"- Action(NOT EXECUTED): {action_details.raw_action}")
             success = action_details.execute_result["success"]
             result = action_details.execute_result["result"]
             tab_changed_info = action_details.execute_result["tab_changed_info"]
@@ -140,8 +142,8 @@ class ActRecord(Record):
             if success and result is not None:
                 actions_info.append(f"- Result: {result}")
             if tab_changed_info is not None:
-                actions_info.append(f"- Tab Changed: {tab_changed_info}")
-                
+                actions_info.append(f"- {tab_changed_info}")
+
         return "\n".join(actions_info)
 
     def save(self, out_dir: Path):
@@ -162,6 +164,8 @@ class ActRecord(Record):
 @dataclass
 class ObservationRecord(Record):
     llm_details: ChatImageListDetails
+    screenshot_path: Path
+    judgment: str
     observation: str
 
     def save(self, out_dir: Path):
@@ -171,6 +175,8 @@ class ObservationRecord(Record):
             {
                 "llm_details": self.llm_details,
                 "observation": self.observation,
+                "judgment": self.judgment,
+                "screenshot_path": str(self.screenshot_path),
                 "time_line": self.time_line.to_dict(),
             },
         )

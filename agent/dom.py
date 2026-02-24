@@ -11,7 +11,8 @@ from loguru import logger
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
-from agent.llm import SecondaryLLM
+from agent.llm import LLMs
+
 
 
 class Viewport:
@@ -756,7 +757,7 @@ DOM elements:
     """.strip()
 
         # resized_image = dom_image.copy().resize((round(dom_image.size[0] * 0.75), round(dom_image.size[1] * 0.75)))
-        res = await SecondaryLLM.chat_with_image_detail(
+        res = await LLMs.vlm_secondary.chat_with_image_detail(
             prompt=prompt,
             image=image,
         )
