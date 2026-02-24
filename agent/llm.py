@@ -54,47 +54,41 @@ class TokenInfo(TypedDict):
     total_tokens: int
 
 
-class PrimaryLLM:
+class LLM:
     client: AsyncClient
-    text_model: str
-    image_model: str
+    model: str
     temperature: float
     token_dict: dict[str, TokenInfo]
 
-    @classmethod
-    def init(
-        cls,
+    def __init__(
+        self,
         api_key: str,
         base_url: str,
         temperature: float,
-        text_model: str,
-        image_model: str,
+        model: str,
     ) -> None:
-        cls.temperature = temperature
-        cls.client = AsyncClient(api_key=api_key, base_url=base_url)
-        cls.text_model = text_model
-        cls.image_model = image_model
-        cls.token_dict = {}
+        self.temperature = temperature
+        self.client = AsyncClient(api_key=api_key, base_url=base_url)
+        self.model = model
+        self.token_dict = {}
 
-    @classmethod
-    def update_token_dict(cls, model: str, usage: CompletionUsage):
-        if model not in cls.token_dict:
-            cls.token_dict[model] = {
+    def update_token_dict(self, model: str, usage: CompletionUsage):
+        if model not in self.token_dict:
+            self.token_dict[model] = {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
             }
 
-        cls.token_dict[model]["completion_tokens"] += usage.completion_tokens
-        cls.token_dict[model]["prompt_tokens"] += usage.prompt_tokens
-        cls.token_dict[model]["total_tokens"] += usage.total_tokens
+        self.token_dict[model]["completion_tokens"] += usage.completion_tokens
+        self.token_dict[model]["prompt_tokens"] += usage.prompt_tokens
+        self.token_dict[model]["total_tokens"] += usage.total_tokens
 
-    @classmethod
     async def chat_with_text_detail(
-        cls, prompt: str, hook: Callable[[str], Awaitable[None]] | None = None, **kwargs
+        self, prompt: str, hook: Callable[[str], Awaitable[None]] | None = None, **kwargs
     ) -> ChatTextDetails:
         params = {
-            "model": cls.text_model,
+            "model": self.model,
             "messages": [
                 {
                     "role": "user",
@@ -103,7 +97,7 @@ class PrimaryLLM:
                     ],
                 }
             ],
-            "temperature": cls.temperature,
+            "temperature": self.temperature,
             "stream": True,
             "stream_options": {
                 "include_usage": True,
@@ -111,6 +105,8 @@ class PrimaryLLM:
             },
             **kwargs,
         }
+        if self.model.startswith("qwen"):
+            params["extra_body"] = {"enable_thinking": False}
 
         start_time = time.time()
         first_token_time = None
@@ -118,7 +114,7 @@ class PrimaryLLM:
         usage = None
 
         try:
-            stream = await cls.client.chat.completions.create(**params)
+            stream = await self.client.chat.completions.create(**params)
             async for chunk in stream:
                 if chunk.choices == [] and chunk.usage is not None:
                     usage = chunk.usage
@@ -142,11 +138,11 @@ class PrimaryLLM:
         completion_tokens = usage.completion_tokens
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
-        cls.update_token_dict(cls.text_model, usage)
+        self.update_token_dict(self.model, usage)
 
         return {
             "prompt": prompt,
-            "model": cls.text_model,
+            "model": self.model,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
@@ -156,9 +152,8 @@ class PrimaryLLM:
             "tps": completion_tokens / (end_time - first_token_time),
         }
 
-    @classmethod
     async def chat_with_image_detail(
-        cls,
+        self,
         prompt: str,
         image: Image,
         default_fmt="JPEG",
@@ -168,7 +163,7 @@ class PrimaryLLM:
         base64_res = image_to_base64(image, default_fmt)
 
         params = {
-            "model": cls.image_model,
+            "model": self.model,
             "messages": [
                 {
                     "role": "user",
@@ -178,7 +173,7 @@ class PrimaryLLM:
                     ],
                 }
             ],
-            "temperature": cls.temperature,
+            "temperature": self.temperature,
             "stream": True,
             "stream_options": {
                 "include_usage": True,
@@ -186,6 +181,8 @@ class PrimaryLLM:
             },
             **kwargs,
         }
+        if self.model.startswith("qwen"):
+            params["extra_body"] = {"enable_thinking": False}
 
         start_time = time.time()
         first_token_time = None
@@ -193,7 +190,7 @@ class PrimaryLLM:
         usage = None
 
         try:
-            stream = await cls.client.chat.completions.create(**params)
+            stream = await self.client.chat.completions.create(**params)
             async for chunk in stream:
                 if chunk.choices == [] and chunk.usage is not None:
                     usage = chunk.usage
@@ -217,11 +214,11 @@ class PrimaryLLM:
         completion_tokens = usage.completion_tokens
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
-        cls.update_token_dict(cls.image_model, usage)
+        self.update_token_dict(self.model, usage)
 
         return {
             "prompt": prompt,
-            "model": cls.image_model,
+            "model": self.model,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
@@ -234,9 +231,8 @@ class PrimaryLLM:
             "image_bytes": base64_res["bytes"],
         }
 
-    @classmethod
     async def chat_with_image_list_detail(
-        cls,
+        self,
         prompt: str,
         image_list: list[Image],
         default_fmt="JPEG",
@@ -246,7 +242,7 @@ class PrimaryLLM:
         base64_res_list = [image_to_base64(image, default_fmt) for image in image_list]
 
         params = {
-            "model": cls.image_model,
+            "model": self.model,
             "messages": [
                 {
                     "role": "user",
@@ -256,7 +252,7 @@ class PrimaryLLM:
                     ],
                 }
             ],
-            "temperature": cls.temperature,
+            "temperature": self.temperature,
             "stream": True,
             "stream_options": {
                 "include_usage": True,
@@ -264,6 +260,8 @@ class PrimaryLLM:
             },
             **kwargs,
         }
+        if self.model.startswith("qwen"):
+            params["extra_body"] = {"enable_thinking": False}
 
         start_time = time.time()
         first_token_time = None
@@ -271,7 +269,7 @@ class PrimaryLLM:
         usage = None
 
         try:
-            stream = await cls.client.chat.completions.create(**params)
+            stream = await self.client.chat.completions.create(**params)
             async for chunk in stream:
                 if chunk.choices == [] and chunk.usage is not None:
                     usage = chunk.usage
@@ -295,11 +293,11 @@ class PrimaryLLM:
         completion_tokens = usage.completion_tokens
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
-        cls.update_token_dict(cls.image_model, usage)
+        self.update_token_dict(self.model, usage)
 
         return {
             "prompt": prompt,
-            "model": cls.image_model,
+            "model": self.model,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
@@ -318,5 +316,22 @@ class PrimaryLLM:
         }
 
 
-class SecondaryLLM(PrimaryLLM):
-    pass
+class LLMs:
+    vlm_primary: LLM
+    llm_primary: LLM
+
+    vlm_secondary: LLM
+    llm_secondary: LLM
+
+    @classmethod
+    def init(
+        cls,
+        vlm_primary_config: dict,
+        llm_primary_config: dict,
+        vlm_secondary_config: dict,
+        llm_secondary_config: dict,
+    ) -> None:
+        cls.vlm_primary = LLM(**vlm_primary_config)
+        cls.llm_primary = LLM(**llm_primary_config)
+        cls.vlm_secondary = LLM(**vlm_secondary_config)
+        cls.llm_secondary = LLM(**llm_secondary_config)
