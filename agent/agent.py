@@ -31,6 +31,7 @@ from agent.record import (
     PlanningRecord,
     PruningDetails,
     Record,
+    RefinementRecord,
     TimeLine,
 )
 from agent.tab import TabManager
@@ -60,6 +61,8 @@ class Agent:
     last_feedback_record: FeedbackRecord | None
     progress: list[str]
     iteration_times: int
+    last_refinement_length: int
+    is_refining: bool
 
     def __init__(self, out_dir: Path, context: BrowserContext, user_request: str):
         self.prompts_dict = load_prompts()
@@ -80,10 +83,8 @@ class Agent:
         self.last_feedback_record = None
         self.progress = []
         self.iteration_times = 0
-
-        if self.out_dir.exists():
-            shutil.rmtree(self.out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.last_refinement_length = 0
+        self.is_refining = False
 
     def get_remaining_action_budget(self) -> str:
         remaining = Config.max_iteration_times - self.iteration_times
@@ -109,7 +110,7 @@ class Agent:
             await self.observation(before_act_screenshot)
 
         # 初次规划
-        extraction_task = await self.planning()
+        extraction_task, refinement_task = await self.planning()
 
         while True:
             assert self.last_planning_record is not None
@@ -128,10 +129,11 @@ class Agent:
                         break
                     else:
                         logger.warning(f"[Feedback] Task not fully completed. Re-planning is required.")
-                        extraction_task = await self.planning()
+                        extraction_task, refinement_task = await self.planning()
                         if self.last_planning_record.task_state_flag != "TASK_ONGOING":
                             feedback_task = await extraction_task
                             await feedback_task
+                            await refinement_task
                             if self.last_planning_record.task_state_flag == "TASK_FAILED":
                                 logger.error(f"[Planning] Task failed (re-planning)")
                             elif self.last_planning_record.task_state_flag == "TASK_FULLY_FINISHED":
@@ -158,12 +160,11 @@ class Agent:
             await self.act()
             # Observation
             await self.observation(before_act_screenshot)
-            # Planning
             await extraction_task  # ensure extraction task (of last planning) is done before next planning
-            # TODO 如果progress过长（token达到某个阈值？）后可以在背景任务中提取有效、去除重复（相对user request)的progress（记录旧的长度，提取成功后，将旧的那几条替换成新的）
-            # 可以考虑用两条：做过什么，获取到了什么用户需要的数据
+            await refinement_task
             self.iteration_times += 1
-            extraction_task = await self.planning()
+            # Planning
+            extraction_task, refinement_task = await self.planning()
 
         end_time = datetime.now()
         logger.info(f"[Time] Total time cost: {format_time_delta(start_time, end_time)}")
@@ -192,6 +193,46 @@ class Agent:
                 break
 
         return fields
+
+    async def refinement(self):
+        if self.is_refining:
+            return
+
+        increased_lentgh = len(self.progress) - self.last_refinement_length
+        if increased_lentgh <= 5:
+            return
+
+        self.is_refining = True
+        time_line = TimeLine()
+        record_index = len(self.records)
+        self.records.append(Record(record_index, time_line))
+        logger.info(f"[{record_index:03}] Refinement")
+
+        old_progress = self.progress.copy()
+        prompt = self.prompts_dict["refinement"].format(
+            user_request=self.user_request,
+            progress_history="\n".join(old_progress),
+        )
+        llm_detail = await LLMs.llm_secondary.chat_with_text_detail(prompt)
+        time_line.add("llm")
+        refined_progress = llm_detail["content"].strip().splitlines()
+        refined_progress = [l.strip().lstrip("- ") for l in refined_progress if l.lstrip().startswith("- ")]
+        logger.debug(f"[Refinement] Reasoning {llm_detail["total_time"]:.2f}s")
+        reduction = len(old_progress) - len(refined_progress)
+        logger.debug(f"[Refinement] Refined progress: {len(self.progress)-reduction} (-{reduction})")
+        self.progress = refined_progress + self.progress[len(old_progress) :]
+        self.last_refinement_length = len(old_progress)
+
+        record = RefinementRecord(
+            index=record_index,
+            llm_details=llm_detail,
+            progress=refined_progress,
+            reduction=reduction,
+            time_line=time_line,
+        )
+        record.save(self.out_dir)
+        self.records[record_index] = record
+        self.is_refining = False
 
     async def feedback(self):
         time_line = TimeLine()
@@ -260,13 +301,13 @@ class Agent:
             logger.debug(f"[Extraction] Reasoning {llm_detail["total_time"]:.2f}s")
             time_line.add("llm")
 
-            content = llm_detail["content"]
-            logger.debug(f"[Extraction] {content}")
-            self.progress.append(content)
+            data = llm_detail["content"]
+            logger.debug(f"[Extraction] {data}")
+            self.progress.append(data)
             record = ExtractionRecord(
                 index=record_index,
                 llm_details=llm_detail,
-                data=content,
+                data=data,
                 time_line=time_line,
             )
             record.save(self.out_dir)
@@ -279,7 +320,7 @@ class Agent:
         feed_back_task = asyncio.create_task(self.feedback())
         return feed_back_task
 
-    async def planning(self) -> asyncio.Task[asyncio.Task[None]]:
+    async def planning(self) -> tuple[asyncio.Task[asyncio.Task[None]], asyncio.Task[None]]:
         time_line = TimeLine()
         record_index = len(self.records)
         self.records.append(Record(record_index, time_line))
@@ -292,7 +333,7 @@ class Agent:
             last_act_goal = "The first Planning. No Last Act Goal."
             last_planning = f"- Task State: {last_task_state}\n- Act Goal: {last_act_goal}"
         else:
-            if self.last_planning_record.task_state == "TASK_FULLY_FINISHED":
+            if self.last_planning_record.task_state_flag == "TASK_FULLY_FINISHED":
                 assert self.last_feedback_record is not None
                 last_planning = (
                     "Previous Planning step concluded that the task (User Request) was fully finished, "
@@ -325,7 +366,7 @@ class Agent:
 
         prompt = self.prompts_dict["planning"].format(
             user_request=self.user_request,
-            progress_history="No entries.",
+            progress_history=self.get_formated_progress_history(),
             last_planning=last_planning,
             last_act=last_act,
             last_act_observation=last_act_observation,
@@ -339,10 +380,11 @@ class Agent:
         act_goal_pattern = re.compile(r"Act Goal:\s*(.*)$", re.DOTALL)  # 到文本末尾
 
         extraction_task = None
+        refinement_task = None
 
         async def hook_extraction_and_feedback(content: str):
-            nonlocal extraction_task
-            if extraction_task is not None:
+            nonlocal extraction_task, refinement_task
+            if extraction_task is not None or refinement_task is not None:  # only execute once
                 return
             new_progress, requested_data_found = self.parse_response(
                 content, [new_progress_pattern, requested_data_found_pattern]
@@ -350,9 +392,10 @@ class Agent:
             if new_progress is None or requested_data_found is None:
                 return
             logger.debug(f"[Planning][New Progress] {new_progress}")
-            self.progress.append(content)
             logger.debug(f"[Planning][Requested Data Found] {requested_data_found}")
+            self.progress.append(new_progress)
             extraction_task = asyncio.create_task(self.extraction(new_progress, requested_data_found))
+            refinement_task = asyncio.create_task(self.refinement())
 
         final_screenshot = screenshot.resize(
             (int(screenshot.width * 0.75), int(screenshot.height * 0.75)), resample=Image.Resampling.LANCZOS
@@ -402,7 +445,8 @@ class Agent:
         self.last_planning_record = record
 
         assert isinstance(extraction_task, asyncio.Task), "Failed to create extraction data task"
-        return extraction_task
+        assert isinstance(refinement_task, asyncio.Task), "Failed to create refinement task"
+        return extraction_task, refinement_task
 
     async def observation(self, before_act_screenshot: Image.Image):
         time_line = TimeLine()
@@ -995,6 +1039,24 @@ User Request:
                         },
                     }
                 )
+            elif isinstance(record, RefinementRecord):
+                records.append(
+                    {
+                        "type": "refinement",
+                        "time_cost": round(record.time_line.total_time(), 4),
+                        "time_point": record.time_line.endpoint(),
+                        "reduction": record.reduction,
+                        "progress": record.progress,
+                        "llm_metric": {
+                            "prompt_tokens": record.llm_details["prompt_tokens"],
+                            "completion_tokens": record.llm_details["completion_tokens"],
+                            "model": record.llm_details["model"],
+                            "response_time": round(record.llm_details["total_time"], 4),
+                            "tps": round(record.llm_details["tps"], 4),
+                            "ttft": round(record.llm_details["ttft"], 4),
+                        },
+                    }
+                )
 
             total_time_values = defaultdict(list)
             response_time_values = defaultdict(list)
@@ -1017,6 +1079,11 @@ User Request:
                 elif isinstance(record, FeedbackRecord):
                     total_time_values["feedback"].append(t)
                     response_time_values["feedback"].append(record.llm_details["total_time"])
+                elif isinstance(record, RefinementRecord):
+                    total_time_values["refinement"].append(t)
+                    response_time_values["refinement"].append(record.llm_details["total_time"])
+
+            total_time_cost = sum([sum(v) for v in total_time_values.values()])
 
             time_cost = {}
             for k in total_time_values.keys():
@@ -1032,6 +1099,7 @@ User Request:
 
         out = {
             "user_request": user_request,
+            "progress": self.progress,
             "token": token,
             "records": records,
             "time_cost": time_cost,
@@ -1050,7 +1118,14 @@ User Request:
 
     @staticmethod
     def save_report(
-        user_request: str, success: bool, result: str, token: dict, time_cost: dict, records: list, out_dir: Path
+        user_request: str,
+        progress: list[str],
+        success: bool,
+        result: str,
+        token: dict,
+        time_cost: dict,
+        records: list,
+        out_dir: Path,
     ):
         report_lines: list[str] = []
 
@@ -1068,7 +1143,7 @@ User Request:
         report_lines.append("")
         # Success
         report_lines.append("### Task Result")
-        report_lines.append(f"- **Success**: {'✅ Yes' if success else '❌ No'}")
+        report_lines.append(f"- **Success**: {'Yes ✅' if success else 'No ❌'}")
         report_lines.append(f"- **Result**: {result}")
         report_lines.append("")
         # Token usage
@@ -1104,7 +1179,7 @@ User Request:
         report_lines.append(
             f"| Total | {planning_times} | {time_cost['total_time']} | {time_cost['total_time'] / planning_times:.4f} | - | - | - |"
         )
-        type_names = ("planning", "extraction", "feedback", "act", "observation")
+        type_names = ("planning", "extraction", "refinement", "feedback", "act", "observation")
         for type_name in type_names:
             t_type_name = f"{type_name}_total"
             r_type_name = f"{type_name}_response"
@@ -1194,11 +1269,8 @@ User Request:
         # Part 2: Progress History
         report_lines.append("## Progress History")
         report_lines.append("")
-        for record in records:
-            if record["type"] == "planning":
-                report_lines.append(f"- {record['new_progress']}")
-            if record["type"] == "extraction":
-                report_lines.append(f"- {record['data']}")
+        for p in progress:
+            report_lines.append(f"- {p}")
         report_lines.append("")
 
         # Part 3: Execution Records
@@ -1305,6 +1377,22 @@ User Request:
                 report_lines.append("")
                 report_lines.append("**Extraction**:")
                 report_lines.append(record["data"])
+                report_lines.append("")
+            # Refinement Record
+            elif record_type == "refinement":
+                report_lines.append(f"### {idx}. Refinement")
+                report_lines.append(f"- **Time Cost**: {record['time_cost']}s")
+                report_lines.append(
+                    f"- **LLM Metric**: model={llm_metric['model']}, response_time={llm_metric['response_time']}, tps={llm_metric['tps']}, ttft={llm_metric['ttft']}"
+                )
+                report_lines.append(
+                    f"- **Token Usage**: prompt={llm_metric['prompt_tokens']}, completion={llm_metric['completion_tokens']}"
+                )
+                report_lines.append("")
+                report_lines.append(f"- **Reduction**: {record['reduction']}")
+                report_lines.append(f"- **Refined Progress**:")
+                for p in record["progress"]:
+                    report_lines.append(f"\t- {p}")
                 report_lines.append("")
 
         # Write md file

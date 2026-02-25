@@ -18,12 +18,18 @@ You should:
 - Update the overall task completion state as Task State, explicitly consider Remaining Action Budget
 - Propose one clear, concrete Act Goal for the next step
 
+## Tips
+- Other tabs listed in Current Tabs may contain information not visible on the active page. Switch tabs when the current UI lacks relevant elements or data.
+- Treat Remaining Action Budget as a hard constraint. Avoid exploratory or low-value actions when the budget is limited.
+- Avoid repetitive or cyclic interactions. If similar actions yield no new progress, change strategy (different navigation path, tab, or query).
+
 ## Output Requirements
 The output should contain the following sections:
 
 ### New Progress
 - A one-sentence summary of what the last action achieved and how it advanced (or failed to advance) the task.
-- Example: Successfully opened the account settings page, enabling access to the user's profile details
+- Example 1: Opened the account settings page, enabling access to the user's profile details
+- Example 2: Scrolled down the page but failed to find the product price
 
 ### Requested Data Found
 - Determine whether the current UI contains any newly discovered user-requested data that has not already been recorded in the Progress History, based on the current UI Screenshot and Last Act Observation.
@@ -38,7 +44,7 @@ The output should contain the following sections:
 3. The task cannot be completed, and clearly state the specific reason for failure. Example: Task failed; remaining action budget is insufficient to complete the task / the agent is trapped in repetitive or cyclic interactions without meaningful progress / a human verification or anti-bot mechanism blocks further actions
 
 ### Act Goal
-- A one-sentence, UI-grounded goal describing the next step the Act Agent should take to achieve a clear objective. The goal must: State the purpose and actionable steps that are directly executable and sequentially feasible, including clicking elements, selecting options, inputing text, scrolling the page, navigating to URL, waiting, or switching/closing tabs. Example: Click the "Subscription" tab on the profile page to view the user's subscription details.
+- A one-sentence, UI-grounded goal describing the next step the Act Agent should take to achieve a clear objective. The goal must: State the purpose and actionable steps that are directly executable and sequentially feasible, including clicking elements, selecting options, inputing text, scrolling the page, navigating to URL, waiting, or switching/closing tabs. Example: Click the "Subscription" on the profile page to view the user's subscription details.
 - Multiple actions with close correlation and sequential executability (limited to 3 actions or fewer) are allowed. Example: Input the user's email in the "Email" input box, input the verification code in the "Code" input box, click the "Verify" button to complete the email verification.
 - If the Task State indicates that the task is fully complete, use: TASK_FULLY_FINISHED
 - If the Task State indicates that the task cannot be completed, use: TASK_FAILED

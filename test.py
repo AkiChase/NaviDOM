@@ -28,7 +28,6 @@ async def run_agent(
         await context.clear_cookies()
         await context.add_init_script(path="agent/scripts/cssSelectorGenerator.js")
 
-        out_dir.mkdir(parents=True, exist_ok=True)
         agent = Agent(
             out_dir=out_dir,
             context=context,

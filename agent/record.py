@@ -129,20 +129,20 @@ class ActRecord(Record):
     def get_actions_descriptions(self) -> str:
         actions_info = []
         for index, action_details in enumerate(self.action_details_list, 1):
-            actions_info.append(f"{index}.")
+            actions_info.append(f"Action {index}.")
             if action_details.action is not None:
-                actions_info.append(f"- Action: {action_details.action.get_description()}")
+                actions_info.append(f"  - Action: {action_details.action.get_description()}")
             else:
-                actions_info.append(f"- Action(NOT EXECUTED): {action_details.raw_action}")
+                actions_info.append(f"  - Action(NOT EXECUTED): {action_details.raw_action}")
             success = action_details.execute_result["success"]
             result = action_details.execute_result["result"]
             tab_changed_info = action_details.execute_result["tab_changed_info"]
             if not success and result is not None:
-                actions_info.append(f"- Error: {result}")
+                actions_info.append(f"  - Error: {result}")
             if success and result is not None:
-                actions_info.append(f"- Result: {result}")
+                actions_info.append(f"  - Result: {result}")
             if tab_changed_info is not None:
-                actions_info.append(f"- {tab_changed_info}")
+                actions_info.append(f"  - {tab_changed_info}")
 
         return "\n".join(actions_info)
 
@@ -177,6 +177,25 @@ class ObservationRecord(Record):
                 "observation": self.observation,
                 "judgment": self.judgment,
                 "screenshot_path": str(self.screenshot_path),
+                "time_line": self.time_line.to_dict(),
+            },
+        )
+
+
+@dataclass
+class RefinementRecord(Record):
+    llm_details: ChatTextDetails
+    progress: list[str]
+    reduction: int
+
+    def save(self, out_dir: Path):
+        super().save(
+            out_dir,
+            "refinement",
+            {
+                "llm_details": self.llm_details,
+                "progress": self.progress,
+                "reduction": self.reduction,
                 "time_line": self.time_line.to_dict(),
             },
         )

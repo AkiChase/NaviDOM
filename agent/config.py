@@ -17,6 +17,7 @@ class Config:
     def init(cls, env_path: str, out_dir: Path):
         if out_dir.exists():
             shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True)
 
         logger.remove()
         logger.add(
