@@ -5,7 +5,6 @@ import itertools
 import json
 from pathlib import Path
 import re
-import shutil
 import statistics
 from loguru import logger
 from matplotlib import pyplot as plt
@@ -221,7 +220,7 @@ class Agent:
         reduction = len(old_progress) - len(refined_progress)
         logger.debug(f"[Refinement] Refined progress: {len(self.progress)-reduction} (-{reduction})")
         self.progress = refined_progress + self.progress[len(old_progress) :]
-        self.last_refinement_length = len(old_progress)
+        self.last_refinement_length = len(refined_progress)
 
         record = RefinementRecord(
             index=record_index,
@@ -546,7 +545,6 @@ User Request:
         action_screenshot.save(action_screenshot_path)
         old_tab_info = await self.tab_manager.get_cur_tab_info()
         action_result = await action.execute(cur_tab, self.tab_manager)
-        await asyncio.sleep(1)
         new_tab_info = await self.tab_manager.get_cur_tab_info()
         execute_result: ActionExecuteResult = {
             "success": True,
@@ -886,7 +884,6 @@ User Request:
                         )
                     )
                     break
-        await asyncio.sleep(1)
 
         record = ActRecord(
             index=record_index,

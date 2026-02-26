@@ -35,10 +35,10 @@ def save_task_as_csv(tasks: list[Mind2WebTask], csv_path: Path):
             )
 
 
-def result_convert(task: Mind2WebTask, result_dir: Path, output_dir: Path):
-    output_dir = output_dir / task["task_id"]
-    screenshot_dir = output_dir / "trajectory"
+def result_convert(task: Mind2WebTask, result_dir: Path, base_output_dir: Path):
+    output_dir = base_output_dir / task["task_id"]
 
+    screenshot_dir = output_dir / "trajectory"
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -47,7 +47,7 @@ def result_convert(task: Mind2WebTask, result_dir: Path, output_dir: Path):
     with open(result_dir / "result.json", "r", encoding="utf-8") as f:
         data = json.load(f)
     act_records = [r for r in data["records"] if r["type"] == "act"]
-    actions_history = []
+    action_history = []
     last_action_result_name = None
     for r in act_records:
         for a in r["actions"]:
@@ -56,14 +56,14 @@ def result_convert(task: Mind2WebTask, result_dir: Path, output_dir: Path):
                 # ActionType.Extract, ActionType.Memory
                 if raw_action.startswith("extract") or raw_action.startswith("memory"):
                     continue
-                actions_history.append(a["description"])
+                action_history.append(a["description"])
                 screenshot_path = result_dir / f"{a['action_screenshot_name']}"
-                shutil.copy(screenshot_path, screenshot_dir / f"{len(actions_history)-1}_screenshot.jpg")
+                shutil.copy(screenshot_path, screenshot_dir / f"{len(action_history)-1}_screenshot.jpg")
                 last_action_result_name = a["result_screenshot_name"]
     assert last_action_result_name is not None
-    shutil.copy(result_dir / last_action_result_name, screenshot_dir / f"{len(actions_history)-1}_screenshot.jpg")
+    shutil.copy(result_dir / last_action_result_name, screenshot_dir / f"{len(action_history)-1}_screenshot.jpg")
 
-    result = {"task_id": task["task_id"], "actions_history": actions_history, "task": task["confirmed_task"]}
+    result = {"task_id": task["task_id"], "action_history": action_history, "task": task["confirmed_task"]}
     with open(output_dir / "result.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=4, ensure_ascii=False)
 

@@ -242,6 +242,7 @@ class Action:
                     await loc.click(timeout=5000, force=True)
                     if self.target.tag == "select":
                         result = f"Warning! Target node is a select element, CLICK did not work, you should only use SELECT_OPTION instead."
+                    await asyncio.sleep(1)
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to click: {e}")
             elif self.type == ActionType.Input:
@@ -254,6 +255,7 @@ class Action:
                         await loc.type(text, timeout=5000)
                     try:
                         await loc.press("Enter", timeout=1000)
+                        await asyncio.sleep(1)
                     except:
                         pass
                 except Exception as e:
@@ -265,6 +267,7 @@ class Action:
                         await loc.select_option(value=options[0], timeout=5000)
                     else:
                         await loc.select_option(value=options, timeout=5000)
+                    await asyncio.sleep(1)
                 except Exception as e:
                     raise ActionExecuteException(f"Failed to select option: {e}")
         elif self.type == ActionType.Scroll:
@@ -282,9 +285,11 @@ class Action:
         elif self.type == ActionType.Navigate:
             url = self.extra["url"]
             await tab.goto(url)
+            await asyncio.sleep(1)
         elif self.type == ActionType.Search:
             keywords = self.extra["keywords"]
             await tab.goto(bing_search_url(keywords))
+            await asyncio.sleep(1)
         elif self.type == ActionType.TabSwitch:
             tab_id = self.extra["tab_id"]
             if tab_id == tab_manager.cur_tab_id:
