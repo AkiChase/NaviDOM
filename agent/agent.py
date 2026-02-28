@@ -605,7 +605,6 @@ User Request:
         time_line.add("fetch")
 
         if Config.debug:
-            # 最细粒度元素可视化
             atomic_screenshot = screenshot.copy()
             atomic_screenshot_draw = ImageDraw.Draw(atomic_screenshot)
             dom.draw_bounds(atomic_screenshot_draw, draw_id=True)
@@ -615,7 +614,6 @@ User Request:
         logger.debug("[Act] Interactive node count: {}", len(interactive_nodes))
 
         if Config.debug:
-            # 交互粒度元素可视化
             interactive_screenshot = screenshot.copy()
             interactive_screenshot_draw = ImageDraw.Draw(interactive_screenshot)
             for node in interactive_nodes:
@@ -631,9 +629,9 @@ User Request:
 
             time_line.add("_debug")
 
-        # 基于语义对元素进行剪枝
-        # 空间聚类， alpha 高时以像素坐标的距离为主；alpha 低时以DOM结构的距离为主
-        # 筛除尺寸过小的无效聚类
+        # Semantic-based pruning of elements
+        # Spatial clustering, with distances to pixel coordinates for high alpha; distances to DOM structures for low alpha
+        # Filter out invalid clusters that are too small in size
         clusters: list[list[DomNode]] = []
         for c in DomCluster.cluster_construct(interactive_nodes, alpha=0.45, max_clusters=5):
             rect = DomCluster.cluster_covered_xyxy(c, viewport)
@@ -677,7 +675,7 @@ User Request:
                 )
             cluster_screenshot.save(self.out_dir / f"{record_prefix}_debug_3_cluster_all.jpg")
 
-        # 基于LLM过滤与任务不相关的聚类区域
+        # Filter out clusters that are not related to the task goal
         related_tasks = []
         related_rects = []
         for index, cluster in enumerate(clusters):
@@ -718,9 +716,9 @@ User Request:
                 exclude_types=[ActionType.Click, ActionType.Input, ActionType.Search, ActionType.SelectOption]
             )
         else:
-            # 合并边界存在重叠的区域，用于构建紧凑的UI图
+            # Merge overlapping clusters to create compact UI layout
             merged_rects = DomCluster.cluster_merge_overlapped(related_cluster)
-            # 构建压缩后的UI图像
+            # Build compact UI layout image from merged clusters
             final_screenshot = DomCluster.cluster_image_layout_compaction(screenshot, merged_rects, default_gap=1)
             final_nodes: list[DomNode] = list(itertools.chain.from_iterable(cluster for cluster, _ in related_cluster))
             final_screenshot.save(self.out_dir / f"{record_prefix}_final.jpg")
@@ -730,6 +728,8 @@ User Request:
             exclude_types = [ActionType.Search, ActionType.Navigate]
             if interactive_nodes_repr.find("<select ") == -1:
                 exclude_types.append(ActionType.SelectOption)
+            if len(self.tab_manager.tab_dict) == 1:
+                exclude_types.append(ActionType.TabClose)
             available_actions = Action.get_available_actions_prompt(exclude_types=exclude_types)
         time_line.add("pruning")
 

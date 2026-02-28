@@ -203,6 +203,8 @@ class Action:
             tab_id = int(parts[1])
             if tab_id not in tab_manager.tab_dict:
                 raise ActionParseException(f"Tab ID {tab_id} not found")
+            if len(tab_manager.tab_dict) == 1:
+                raise ActionParseException("Cannot close the last tab")
             return Action(uid, action_type, None, {"tab_id": tab_id})
         elif action_type == ActionType.WAIT:
             # WAIT, <seconds>
