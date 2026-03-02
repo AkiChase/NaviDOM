@@ -296,7 +296,7 @@ class Agent:
                 last_requested_data_found=req_data_found,
                 html=dom_repr,
             )
-            llm_detail = await LLMs.vlm_secondary.chat_with_image_detail(prompt, screenshot)
+            llm_detail = await LLMs.vlm_secondary.chat_with_image_detail(prompt, screenshot, max_tokens=1024)
             logger.debug(f"[Extraction] Reasoning {llm_detail["total_time"]:.2f}s")
             time_line.add("llm")
 
@@ -373,10 +373,22 @@ class Agent:
             remaining_action_budget=remaining_action_budget,
         )
 
-        new_progress_pattern = re.compile(r"New Progress:\s*(.*?)\s*Requested Data Found:", re.DOTALL)
-        requested_data_found_pattern = re.compile(r"Requested Data Found:\s*(.*?)\s*Task State:", re.DOTALL)
-        task_state_pattern = re.compile(r"Task State:\s*(.*?)\s*Act Goal:", re.DOTALL)
-        act_goal_pattern = re.compile(r"Act Goal:\s*(.*)$", re.DOTALL)  # 到文本末尾
+        new_progress_pattern = re.compile(
+            r"(?:^|\n)\s*(?:#+\s*)?New Progress\s*:?\s*(.*?)(?=\n\s*(?:#+\s*)?Requested Data Found\s*:?)",
+            re.DOTALL,
+        )
+        requested_data_found_pattern = re.compile(
+            r"(?:^|\n)\s*(?:#+\s*)?Requested Data Found\s*:?\s*(.*?)(?=\n\s*(?:#+\s*)?Task State\s*:?)",
+            re.DOTALL,
+        )
+        task_state_pattern = re.compile(
+            r"(?:^|\n)\s*(?:#+\s*)?Task State\s*:?\s*(.*?)(?=\n\s*(?:#+\s*)?Act Goal\s*:?)",
+            re.DOTALL,
+        )
+        act_goal_pattern = re.compile(
+            r"(?:^|\n)\s*(?:#+\s*)?Act Goal\s*:?\s*(.*)$",
+            re.DOTALL,
+        )
 
         extraction_task = None
         refinement_task = None
@@ -412,10 +424,11 @@ class Agent:
             content, [new_progress_pattern, requested_data_found_pattern, task_state_pattern, act_goal_pattern]
         )
         new_progress, requested_data_found, task_state, act_goal = fields
-        assert new_progress is not None, "Failed to parse expected New Progress in LLM response"
-        assert requested_data_found is not None, "Failed to parse expected Requested Data Found in LLM response"
-        assert task_state is not None, "Failed to parse expected Task State in LLM response"
-        assert act_goal is not None, "Failed to parse expected Act Goal in LLM response"
+        err_msg = "Failed to parse {} in LLM response:\n{}"
+        assert new_progress is not None, err_msg.format("New Progress", content)
+        assert requested_data_found is not None, err_msg.format("Requested Data Found", content)
+        assert task_state is not None, err_msg.format("Task State", content)
+        assert act_goal is not None, err_msg.format("Act Goal", content)
 
         task_state_flag = "TASK_ONGOING"
         for kw in ["TASK_ONGOING", "TASK_FULLY_FINISHED"]:

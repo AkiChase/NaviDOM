@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TypedDict
 import csv
 from PIL import Image
+from loguru import logger
 from openai import OpenAI
 
 
@@ -314,15 +315,17 @@ async def judge_task(task_dir: Path, llm: OpenaiEngine, score_threshold: int):
     output_results["image_judge_record"] = record
     output_results["key_points"] = key_points
 
-    response = llm.generate(messages)[0]
     predicted_label = -1
     try:
+        response = llm.generate(messages)[0]
         assert response is not None, "LLM response is None"
         if "success" in response.lower().split("status:")[1]:
             predicted_label = 1
         else:
             predicted_label = 0
-    except:
+    except Exception as e:
+        response = str(e)
+        logger.error(f"Error judging task: {e}")
         predicted_label = -1
 
 
