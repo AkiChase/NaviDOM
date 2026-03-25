@@ -43,7 +43,7 @@ if __name__ == "__main__":
     asyncio.run(
         run_agent(
             out_dir=Path("output/test"),
-            task="找到star数量最高的和自动化相关的仓库，告诉我仓库的名称、地址和star数量",
-            start_url="https://github.com/",
+            task="在B站找到一个关于如何在笔记本电脑部署Qwen大模型的教程视频",
+            start_url="https://www.bilibili.com/",
         )
     )
