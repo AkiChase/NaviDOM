@@ -248,17 +248,20 @@ The potentially important snapshots of the webpage in the agent's trajectory and
     whole_content_img = []
     whole_thoughts = []
     record = []
-    pattern = r"[1-5]"
+    score_pattern = re.compile(r"\*\*?Score\*\*?\s*[:\-]?\s*([1-5])", re.IGNORECASE)
+    reason_pattern = re.compile(r"\*\*?Reasoning\*\*?\s*:\s*(.*?)(?:\n\s*\n|\*\*?Score|\Z)", re.IGNORECASE | re.S)
     for response, image_path in zip(image_responses, images_path):
         try:
-            score_text = response.split("Score")[1]
-            thought = response.split("**Reasoning**:")[-1].strip().lstrip("\n").split("\n\n")[0].replace("\n", " ")
-            score = re.findall(pattern, score_text)[0]
-            record.append({"Response": response, "Score": int(score)})
+            score_match = score_pattern.search(response)
+            reason_match = reason_pattern.search(response)
+            score = int(score_match.group(1)) if score_match else 0
+            thought = reason_match.group(1).strip().replace("\n", " ") if reason_match else ""
+            record.append({"Response": response, "Score": score, "Reasoning": thought})
         except Exception as e:
-            print(f"Error processing response: {e}")
-            score = 0
-            record.append({"Response": response, "Score": 0})
+            logger.error(f"Error processing response: {e}")
+            logger.debug(response)
+
+            record.append({"Response": response, "Score": 0, "Reasoning": ""})
 
         if int(score) >= score_threshold:
             jpg_base64_str = encode_image(Image.open(image_path))
@@ -291,7 +294,7 @@ Action History:
     return messages, text, system_msg, record, key_points
 
 
-MAX_IMAGE = 15
+MAX_IMAGE = 12
 
 
 async def judge_task(task_dir: Path, llm: OpenaiEngine, score_threshold: int):
@@ -319,15 +322,18 @@ async def judge_task(task_dir: Path, llm: OpenaiEngine, score_threshold: int):
     try:
         response = llm.generate(messages)[0]
         assert response is not None, "LLM response is None"
-        if "success" in response.lower().split("status:")[1]:
-            predicted_label = 1
-        else:
-            predicted_label = 0
+
+        match = re.search(r"status\s*[:\-]\s*['\"]?(success|failure)['\"]?", response, re.IGNORECASE)
+        if not match:
+            logger.debug(response)
+            raise Exception("status not found in LLM response")
+        status = match.group(1).lower()
+        predicted_label = 1 if "success" in status else 0
     except Exception as e:
         response = str(e)
         logger.error(f"Error judging task: {e}")
+        logger.exception(e)
         predicted_label = -1
-
 
     # Store evaluation details
     evaluation_results = {"response": response, "predicted_label": predicted_label}
