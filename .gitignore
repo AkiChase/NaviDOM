@@ -19,3 +19,4 @@ local
 script_evaluate.py
 script_mark.py
 script_convert.py
+script_statistics.py
