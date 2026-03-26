@@ -19,6 +19,12 @@
 
 ## Benchmark 评估
 
+评估模型设置:
+- `vlm_primary_service = qwen3.5-397b-a17b`
+- `llm_primary_service = qwen3.5-397b-a17b`
+- `vlm_secondary_service = qwen3-vl-2b-instruct`
+- `llm_secondary_service = qwen3-4b`
+
 在 [Online-Mind2Web2](https://huggingface.co/datasets/osunlp/Online-Mind2Web) 基准测试中，本项目取得了以下结果：
 
 | 难度     |         成功率 |  评估进度 |
