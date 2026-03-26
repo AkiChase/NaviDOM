@@ -16,10 +16,10 @@ async def run_agent(
         context = await p.chromium.launch_persistent_context(
             user_data_dir="",
             headless=False,
-            args=[
-                f"--disable-extensions-except=local/I-Still-Dont-Care-About-Cookies",
-                f"--load-extension=local/I-Still-Dont-Care-About-Cookies",
-            ],
+            # args=[
+            #     f"--disable-extensions-except=local/I-Still-Dont-Care-About-Cookies",
+            #     f"--load-extension=local/I-Still-Dont-Care-About-Cookies",
+            # ],
             viewport={
                 "width": Config.browser_viewport_w,
                 "height": Config.browser_viewport_h,

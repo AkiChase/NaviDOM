@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import itertools
 import math
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 import numpy as np
 from playwright.async_api import Page, Locator, Frame
 from PIL import ImageDraw, ImageFont, Image
